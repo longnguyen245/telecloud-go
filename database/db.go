@@ -8,8 +8,8 @@ import (
 	"time"
 
 	_ "github.com/go-sql-driver/mysql"
+	_ "github.com/jackc/pgx/v5/stdlib"
 	"github.com/jmoiron/sqlx"
-	_ "github.com/lib/pq"
 	_ "modernc.org/sqlite"
 )
 
@@ -52,12 +52,12 @@ type WrappedDB struct {
 }
 
 func RebindQuery(query string) string {
-	switch driverName {
-	case "postgres":
+	if driverName == "postgres" &&
+		!strings.Contains(query, "$1") {
 		return sqlx.Rebind(sqlx.DOLLAR, query)
-	default:
-		return query
 	}
+
+	return query
 }
 
 func (db *WrappedDB) Exec(query string, args ...interface{}) (sql.Result, error) {
@@ -170,7 +170,7 @@ func InitDB(driver, dbPath, dbDSN string) error {
 			return fmt.Errorf("DATABASE_DSN must be set when DATABASE_DRIVER=postgres")
 		}
 
-		rawDB, err = sqlx.Connect("postgres", dbDSN)
+		rawDB, err = sqlx.Connect("pgx", dbDSN)
 		if err != nil {
 			return err
 		}
