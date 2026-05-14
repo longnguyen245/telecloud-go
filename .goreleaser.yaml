@@ -61,7 +61,4 @@ changelog:
       - '^test:'
 
 release:
-  github:
-    owner: dabeecao
-    name: telecloud-go
   prerelease: auto
