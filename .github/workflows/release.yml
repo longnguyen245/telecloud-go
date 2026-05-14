@@ -45,8 +45,15 @@ jobs:
           distribution: goreleaser
           version: "~> v2"
           args: release --clean --parallelism 1 --skip=validate
+          workdir: myfolder
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Upload assets
+        uses: actions/upload-artifact@v4
+        with:
+          name: myapp
+          path: myfolder/dist/*
 
   docker:
     runs-on: ubuntu-latest
