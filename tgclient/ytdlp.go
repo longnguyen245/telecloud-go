@@ -131,7 +131,18 @@ func GetYTDLPFormats(url string, cfg *config.Config, owner string) (*YTDLPInfo, 
 	}
 
 	var info YTDLPInfo
-	decoder := json.NewDecoder(strings.NewReader(stdout.String()))
+	
+	// Decode the string and automatically ignore any trailing junk data
+	rawStr := stdout.String()
+
+	startIdx := strings.IndexAny(rawStr, "{")
+	if startIdx == -1 {
+		return nil, fmt.Errorf("json_unmarshal_error: no valid JSON start found")
+	}
+
+	cleanStr := rawStr[startIdx:]
+
+	decoder := json.NewDecoder(strings.NewReader(cleanStr))
 	if err := decoder.Decode(&info); err != nil {
 		return nil, fmt.Errorf("json_unmarshal_error: %w", err)
 	}
