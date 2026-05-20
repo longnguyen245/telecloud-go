@@ -177,11 +177,22 @@ if not exist ".env" (
         powershell -Command "(Get-Content .env) -replace '^#?TORRENT_PATH=.*', 'TORRENT_PATH=aria2c' | Set-Content .env"
     )
 
+    :: Automatically generate random keys for Windows
+    for /f "tokens=*" %%a in ('powershell -Command "[byte[]]$b = New-Object byte[] 32; [Security.Cryptography.RNGCryptoServiceProvider]::Create().GetBytes($b); [System.BitConverter]::ToString($b).Replace(\'-\', \'\').ToLower()"') do set "MASTER_KEY=%%a"
+    if not "!MASTER_KEY!"=="" (
+        powershell -Command "(Get-Content .env) -replace '^TELECLOUD_MASTER_KEY=.*', 'TELECLOUD_MASTER_KEY=!MASTER_KEY!' | Set-Content .env"
+    )
+
     echo [v] Installation complete!
     echo.
-    echo [!] The application will run in Setup Mode.
-    echo [!] Please start TeleCloud (Option 3) then visit:
-    echo     http://YOUR_IP_OR_DOMAIN:8091/setup
+    echo ==================================================================
+    echo WARNING: PLEASE BACK UP THE MASTER KEY BELOW TO YOUR PASSWORD MANAGER!
+    echo     Losing this key = losing access to encrypted Telegram sessions & secrets.
+    echo     TELECLOUD_MASTER_KEY=!MASTER_KEY!
+    echo ------------------------------------------------------------------
+    echo [!] Please start TeleCloud (Option 3) then visit the setup link:
+    echo     http://127.0.0.1:8091/setup
+    echo ==================================================================
     pause
     goto MENU
 

@@ -347,13 +347,12 @@ func LoginPasskeyFinish(c *gin.Context) {
 		credential.Authenticator.SignCount, credential.Flags.BackupState, credential.ID)
 
 	// Create session
-	sessionToken := uuid.New().String()
-	_, err = database.DB.Exec("INSERT INTO sessions (token, username) VALUES (?, ?)", sessionToken, username)
+	sessionToken, err := database.CreateSession(username)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to create session"})
 		return
 	}
-	c.SetCookie("session_token", sessionToken, 3600*24*30, "/", "", false, true)
+	c.SetCookie("session_token", sessionToken, int(database.SessionTTL.Seconds()), "/", "", isSecure(), true)
 
 	var forceChange int
 	if username != database.GetSetting("admin_username") {

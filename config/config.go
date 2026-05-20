@@ -9,6 +9,8 @@ import (
 	"strings"
 
 	"github.com/joho/godotenv"
+
+	"telecloud/utils"
 )
 
 type Config struct {
@@ -35,6 +37,7 @@ type Config struct {
 	Warnings         []string
 	TorrentEnabled   bool
 	TorrentPath      string
+	ListenAddr       string
 }
 
 func Load() (*Config, error) {
@@ -42,6 +45,10 @@ func Load() (*Config, error) {
 	err := godotenv.Load()
 	if err != nil && !os.IsNotExist(err) {
 		warnings = append(warnings, "Error loading .env file: "+err.Error())
+	}
+
+	if _, err := utils.LoadMasterKey(); err != nil {
+		return nil, err
 	}
 
 	apiID, _ := strconv.Atoi(os.Getenv("API_ID"))
@@ -114,6 +121,7 @@ func Load() (*Config, error) {
 		Warnings:         warnings,
 		TorrentEnabled:   torrentEnabled,
 		TorrentPath:      torrentPath,
+		ListenAddr:       getEnv("LISTEN_ADDR", ""),
 	}, nil
 }
 

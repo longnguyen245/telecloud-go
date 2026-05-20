@@ -22,10 +22,10 @@ RUN go mod download
 # Copy source code
 COPY . .
 
-# Fetch frontend submodule (web/ is a git submodule, COPY doesn't include it)
-RUN git submodule update --init --recursive
+# Fetch frontend submodule if building from a git clone
+RUN if [ -d .git ]; then git submodule update --init --recursive; else echo "Not a git repository, skipping submodule init"; fi
 
-# Build frontend (Tailwind + download JS/CSS libs)
+# Build frontend (Tailwind + bundle assets via npm)
 RUN cd web && sed -i 's/\r$//' build-frontend.sh && bash build-frontend.sh 1
 
 # Build Go binary for TARGET architecture
@@ -41,17 +41,24 @@ RUN mkdir -p /app/data && chown 65532:65532 /app/data
 # ============================================================
 # Stage 2: Minimal runtime image
 # ============================================================
-FROM alpine:latest
+# Pin alpine major.minor for reproducible builds. Bump deliberately.
+FROM alpine:3.21
 
 WORKDIR /app
 
 # Create a non-root user
 RUN addgroup -g 65532 nonroot && adduser -u 65532 -G nonroot -D nonroot
 
-# Install required packages: ca-certificates, tzdata, ffmpeg, python3, aria2
-RUN apk add --no-cache ca-certificates tzdata ffmpeg python3 aria2 \
-    && wget -qO /usr/local/bin/yt-dlp https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp \
-    && chmod a+rx /usr/local/bin/yt-dlp
+# Install required packages: ca-certificates, tzdata, ffmpeg, python3, aria2.
+# yt-dlp is downloaded from upstream and SHA-256 verified against the
+# checksum file published alongside the same release tag.
+RUN apk add --no-cache ca-certificates tzdata ffmpeg python3 aria2 wget \
+    && set -eux \
+    && wget -qO /tmp/yt-dlp        https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp \
+    && wget -qO /tmp/yt-dlp.sha256 https://github.com/yt-dlp/yt-dlp/releases/latest/download/SHA2-256SUMS \
+    && (cd /tmp && grep -E '  yt-dlp$' yt-dlp.sha256 | sha256sum -c -) \
+    && install -m 0755 /tmp/yt-dlp /usr/local/bin/yt-dlp \
+    && rm -f /tmp/yt-dlp /tmp/yt-dlp.sha256
 
 # Set default environment variables for external tools
 ENV TORRENT_PATH=/usr/bin/aria2c

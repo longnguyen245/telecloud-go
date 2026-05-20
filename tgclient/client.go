@@ -3,6 +3,7 @@ package tgclient
 import (
 	"bufio"
 	"context"
+	"encoding/json"
 	"fmt"
 	"log"
 	"net"
@@ -19,6 +20,7 @@ import (
 
 	"telecloud/config"
 	"telecloud/database"
+	"telecloud/utils"
 
 	"github.com/gotd/td/session"
 	"github.com/gotd/td/telegram"
@@ -72,9 +74,10 @@ func GetAuthStatus(ctx context.Context) (*auth.Status, error) {
 }
 
 type BotInstance struct {
-	Client  *telegram.Client
-	Token   string
-	Deleted bool // Mark as deleted if initialization fails
+	Client        *telegram.Client
+	Token         string
+	Deleted       bool // Mark as deleted if initialization fails
+	CooldownUntil time.Time
 }
 
 func GetAPI() *tg.Client {
@@ -82,8 +85,9 @@ func GetAPI() *tg.Client {
 	defer botPoolMu.RUnlock()
 
 	var activeIndices []int
+	now := time.Now()
 	for i := range BotPool {
-		if !BotPool[i].Deleted {
+		if !BotPool[i].Deleted && now.After(BotPool[i].CooldownUntil) {
 			activeIndices = append(activeIndices, i)
 		}
 	}
@@ -94,6 +98,49 @@ func GetAPI() *tg.Client {
 		return Client.API()
 	}
 	return BotPool[activeIndices[idx-1]].Client.API()
+}
+
+func MarkBotCooldown(api *tg.Client, seconds int) {
+	botPoolMu.Lock()
+	defer botPoolMu.Unlock()
+
+	now := time.Now()
+	cooldownTime := now.Add(time.Duration(seconds) * time.Second)
+
+	for i := range BotPool {
+		if BotPool[i].Client.API() == api {
+			if BotPool[i].CooldownUntil.Before(cooldownTime) {
+				BotPool[i].CooldownUntil = cooldownTime
+				log.Printf("[BotPool] Bot #%d (%s) is rate-limited. Cooling down for %d seconds...", i+1, BotPool[i].Token[:8]+"...", seconds)
+			}
+			break
+		}
+	}
+}
+
+func ParseFloodWait(err error) (int, bool) {
+	if err == nil {
+		return 0, false
+	}
+	errStr := err.Error()
+	if idx := strings.Index(errStr, "FLOOD_WAIT_"); idx != -1 {
+		sub := errStr[idx+len("FLOOD_WAIT_"):]
+		var digits []rune
+		for _, r := range sub {
+			if r >= '0' && r <= '9' {
+				digits = append(digits, r)
+			} else {
+				break
+			}
+		}
+		if len(digits) > 0 {
+			if secs, err := strconv.Atoi(string(digits)); err == nil {
+				return secs, true
+			}
+		}
+		return 10, true
+	}
+	return 0, false
 }
 
 func GetBotCount() int {
@@ -146,14 +193,32 @@ type DBSessionStorage struct {
 
 func (s *DBSessionStorage) LoadSession(ctx context.Context) ([]byte, error) {
 	data, err := database.GetTGSession(s.SessionID)
-	if err != nil {
+	if err != nil || len(data) == 0 {
 		return nil, session.ErrNotFound
 	}
-	return data, nil
+	// Decrypt blobs that were stored with EncryptAEAD.
+	plain, err := utils.DecryptAEAD(data)
+	if err != nil {
+		// If decryption fails, the data could be a legacy plaintext JSON session
+		// from pre-encryption. We verify if it is valid JSON.
+		// If it's NOT valid JSON, it's either corrupted or encrypted with a different key,
+		// so we must treat it as not found so gotd can cleanly recreate the session.
+		if json.Valid(data) {
+			log.Printf("[Session] Loaded legacy plaintext session for %s", s.SessionID)
+			return data, nil
+		}
+		log.Printf("[Session] Decryption failed and data is not valid JSON for %s. Treating as ErrNotFound.", s.SessionID)
+		return nil, session.ErrNotFound
+	}
+	return plain, nil
 }
 
 func (s *DBSessionStorage) StoreSession(ctx context.Context, data []byte) error {
-	return database.SetTGSession(s.SessionID, data)
+	enc, err := utils.EncryptAEAD(data)
+	if err != nil {
+		return err
+	}
+	return database.SetTGSession(s.SessionID, enc)
 }
 
 

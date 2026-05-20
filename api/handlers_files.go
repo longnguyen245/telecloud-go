@@ -2,7 +2,6 @@ package api
 
 import (
 	"context"
-	"database/sql"
 	"fmt"
 	"io"
 	"log"
@@ -26,11 +25,8 @@ import (
 
 func (h *Handler) handleGetIndex(c *gin.Context) {
 	token, _ := c.Cookie("session_token")
-	var sessionUsername string
-	if token != "" {
-		database.RODB.Get(&sessionUsername, "SELECT username FROM sessions WHERE token = ?", token)
-	}
-	if token == "" || sessionUsername == "" {
+	sessionUsername := database.LookupSessionUser(token)
+	if sessionUsername == "" {
 		c.Redirect(http.StatusFound, "/login")
 		return
 	}
@@ -307,10 +303,24 @@ func (h *Handler) handlePostUpload(c *gin.Context) {
 		totalSize = int64(totalChunks) * int64(chunkSize) // Fallback estimation
 	}
 
-	val, _ := chunkTrackerSync.LoadOrStore(taskID, &chunkState{
+	val, loaded := chunkTrackerSync.LoadOrStore(taskID, &chunkState{
 		received: make(map[int]bool),
 	})
 	state := val.(*chunkState)
+
+	if !loaded {
+		// Task first loaded in memory in this session (e.g. after server restart or resume)
+		// Load existing chunks from DB to synchronise the state.
+		var dbChunks []int
+		err := database.RODB.Select(&dbChunks, "SELECT chunk_index FROM upload_chunks WHERE task_id = ?", taskID)
+		if err == nil {
+			state.Lock()
+			for _, chIdx := range dbChunks {
+				state.received[chIdx] = true
+			}
+			state.Unlock()
+		}
+	}
 
 	// Update temporary file path with taskID and safe filename
 	tempFilePath = filepath.Join(tempDir, taskID+"_"+safeFilename)
@@ -349,8 +359,8 @@ func (h *Handler) handlePostUpload(c *gin.Context) {
 	state.Lock()
 	state.received[chunkIndex] = true
 
-	var actualReceived int
-	database.RODB.Get(&actualReceived, "SELECT COUNT(*) FROM upload_chunks WHERE task_id = ?", taskID)
+	// ✅ OPTIMIZATION: Count chunks directly from memory map, eliminating hot-path SQLite SELECT COUNT(*) queries.
+	actualReceived := len(state.received)
 
 	// Update task with current progress to show speed in backend
 	uploadedBytes := int64(actualReceived) * int64(chunkSize)
@@ -374,6 +384,14 @@ func (h *Handler) handlePostUpload(c *gin.Context) {
 		tgclient.UpdateTask(taskID, "uploading_to_server", 100, "", username)
 
 		mimeType := header.Header.Get("Content-Type")
+		// Browsers often send wrong or generic MIME types; fallback using extension.
+		if mimeType == "" || mimeType == "application/octet-stream" {
+			if ext := filepath.Ext(filename); ext != "" {
+				if detected := mime.TypeByExtension(ext); detected != "" {
+					mimeType = detected
+				}
+			}
+		}
 		if mimeType == "" {
 			mimeType = "application/octet-stream"
 		}
@@ -454,18 +472,10 @@ func (h *Handler) handlePostRemoteUploadCheck(c *gin.Context) {
 		return
 	}
 
-	client := &http.Client{
-		Timeout: 10 * time.Second,
-		CheckRedirect: func(req *http.Request, via []*http.Request) error {
-			if len(via) >= 10 {
-				return fmt.Errorf("too many redirects")
-			}
-			if utils.IsPrivateIP(req.URL.String()) {
-				return fmt.Errorf("forbidden_url")
-			}
-			return nil
-		},
-	}
+	// SafeHTTPClient re-resolves and rejects private/loopback IPs at dial
+	// time, defeating DNS-rebinding tricks the upfront IsPrivateIP check
+	// can't catch on its own.
+	client := utils.SafeHTTPClient(10 * time.Second)
 
 	req, err := http.NewRequestWithContext(c.Request.Context(), "HEAD", remoteURL, nil)
 	if err != nil {
@@ -668,32 +678,20 @@ func (h *Handler) handlePostPaste(c *gin.Context) {
 				}
 
 				for _, child := range children {
-					var newChildID int64
-					var res sql.Result
-					err = nil
 					newChildPath := newPrefix + child.Path[len(oldPrefix):]
-					if database.IsPostgres() {
-						err = tx.QueryRowx("INSERT INTO files (message_id, filename, path, size, mime_type, is_folder, thumb_path, owner) VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING id",
-							child.MessageID, child.Filename, newChildPath, child.Size, child.MimeType, child.IsFolder, child.ThumbPath, username).Scan(&newChildID)
-					} else {
-						res, err = tx.Exec("INSERT INTO files (message_id, filename, path, size, mime_type, is_folder, thumb_path, owner) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-							child.MessageID, child.Filename, newChildPath, child.Size, child.MimeType, child.IsFolder, child.ThumbPath, username)
-					}
+					newChildID, err := database.InsertAndGetID(tx,
+						"INSERT INTO files (message_id, filename, path, size, mime_type, is_folder, thumb_path, owner) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+						child.MessageID, child.Filename, newChildPath, child.Size, child.MimeType, child.IsFolder, child.ThumbPath, username)
 					if err != nil {
 						c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 						return
 					}
 
 					if !child.IsFolder {
-						if !database.IsPostgres() {
-							newChildID, err = res.LastInsertId()
-						}
-						if err == nil {
-							_, err = tx.Exec("INSERT INTO file_parts (file_id, part_index, message_id, size) SELECT ?, part_index, message_id, size FROM file_parts WHERE file_id = ?", newChildID, child.ID)
-							if err != nil {
-								c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-								return
-							}
+						_, err = tx.Exec("INSERT INTO file_parts (file_id, part_index, message_id, size) SELECT ?, part_index, message_id, size FROM file_parts WHERE file_id = ?", newChildID, child.ID)
+						if err != nil {
+							c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+							return
 						}
 					}
 				}
@@ -701,28 +699,17 @@ func (h *Handler) handlePostPaste(c *gin.Context) {
 				if item.MessageID == nil {
 					continue
 				}
-				var newFileID int64
-				var res sql.Result
-				err = nil
-				if database.IsPostgres() {
-					err = tx.QueryRowx("INSERT INTO files (message_id, filename, path, size, mime_type, is_folder, thumb_path, owner) VALUES ($1, $2, $3, $4, $5, 0, $6, $7) RETURNING id",
-						item.MessageID, uniqueName, req.Destination, item.Size, item.MimeType, item.ThumbPath, username).Scan(&newFileID)
-				} else {
-					res, err = tx.Exec("INSERT INTO files (message_id, filename, path, size, mime_type, is_folder, thumb_path, owner) VALUES (?, ?, ?, ?, ?, 0, ?, ?)", item.MessageID, uniqueName, req.Destination, item.Size, item.MimeType, item.ThumbPath, username)
-				}
+				newFileID, err := database.InsertAndGetID(tx,
+					"INSERT INTO files (message_id, filename, path, size, mime_type, is_folder, thumb_path, owner) VALUES (?, ?, ?, ?, ?, 0, ?, ?)",
+					item.MessageID, uniqueName, req.Destination, item.Size, item.MimeType, item.ThumbPath, username)
 				if err != nil {
 					c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 					return
 				}
-				if !database.IsPostgres() {
-					newFileID, err = res.LastInsertId()
-				}
-				if err == nil {
-					_, err = tx.Exec("INSERT INTO file_parts (file_id, part_index, message_id, size) SELECT ?, part_index, message_id, size FROM file_parts WHERE file_id = ?", newFileID, item.ID)
-					if err != nil {
-						c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-						return
-					}
+				_, err = tx.Exec("INSERT INTO file_parts (file_id, part_index, message_id, size) SELECT ?, part_index, message_id, size FROM file_parts WHERE file_id = ?", newFileID, item.ID)
+				if err != nil {
+					c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+					return
 				}
 			}
 		}
@@ -1270,6 +1257,14 @@ func (h *Handler) handlePublicUploadAPI(c *gin.Context) {
 	}
 
 	mimeType := header.Header.Get("Content-Type")
+	// Browsers often send wrong or generic MIME types; fallback using extension.
+	if mimeType == "" || mimeType == "application/octet-stream" {
+		if ext := filepath.Ext(filename); ext != "" {
+			if detected := mime.TypeByExtension(ext); detected != "" {
+				mimeType = detected
+			}
+		}
+	}
 	if mimeType == "" {
 		mimeType = "application/octet-stream"
 	}

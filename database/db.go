@@ -5,12 +5,15 @@ import (
 	"fmt"
 	"path"
 	"strings"
+	"sync"
 	"time"
 
 	_ "github.com/go-sql-driver/mysql"
 	_ "github.com/jackc/pgx/v5/stdlib"
 	"github.com/jmoiron/sqlx"
 	_ "modernc.org/sqlite"
+
+	"telecloud/utils"
 )
 
 // JoinPath joins path elements and ensures the result is a clean, absolute path starting with /.
@@ -52,11 +55,9 @@ type WrappedDB struct {
 }
 
 func RebindQuery(query string) string {
-	if driverName == "postgres" &&
-		!strings.Contains(query, "$1") {
+	if driverName == "postgres" {
 		return sqlx.Rebind(sqlx.DOLLAR, query)
 	}
-
 	return query
 }
 
@@ -100,6 +101,14 @@ func (tx *WrappedTx) Select(dest interface{}, query string, args ...interface{})
 	return tx.Tx.Select(dest, RebindQuery(query), args...)
 }
 
+func (tx *WrappedTx) QueryRowx(query string, args ...interface{}) *sqlx.Row {
+	return tx.Tx.QueryRowx(RebindQuery(query), args...)
+}
+
+func (db *WrappedDB) QueryRowx(query string, args ...interface{}) *sqlx.Row {
+	return db.DB.QueryRowx(RebindQuery(query), args...)
+}
+
 func (db *WrappedDB) Beginx() (*WrappedTx, error) {
 	tx, err := db.DB.Beginx()
 	if err != nil {
@@ -131,7 +140,7 @@ func InitDB(driver, dbPath, dbDSN string) error {
 	switch driverName {
 	case "sqlite":
 		// Add PRAGMA settings to improve concurrency and prevent SQLITE_BUSY errors.
-		dsn := fmt.Sprintf("%s?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)", dbPath)
+		dsn := fmt.Sprintf("%s?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)&_pragma=synchronous(NORMAL)&_pragma=temp_store(MEMORY)", dbPath)
 
 		// Initialize Write Pool (MaxOpenConns=1)
 		rawRWDB, err = sqlx.Connect("sqlite", dsn)
@@ -180,22 +189,23 @@ func InitDB(driver, dbPath, dbDSN string) error {
 
 		schema = postgresSchema
 	default:
-		return fmt.Errorf("unsupported DATABASE_DRIVER %q (supported: sqlite, mysql)", driver)
+		return fmt.Errorf("unsupported DATABASE_DRIVER %q (supported: sqlite, mysql, postgres)", driver)
 	}
 
 	if err := execSchema(schema); err != nil {
 		return fmt.Errorf("failed to create schema: %v", err)
 	}
 
-	if driverName == "mysql" {
+	switch driverName {
+	case "mysql":
 		if err := migrateMySQL(); err != nil {
 			return err
 		}
-	} else if driverName == "postgres" {
+	case "postgres":
 		if err := migratePostgres(); err != nil {
 			return err
 		}
-	} else {
+	default:
 		if err := migrateSQLite(); err != nil {
 			return err
 		}
@@ -239,8 +249,17 @@ const sqliteSchema = `
 	CREATE TABLE IF NOT EXISTS sessions (
 		token TEXT PRIMARY KEY,
 		created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-		username TEXT DEFAULT ''
+		username TEXT DEFAULT '',
+		expires_at DATETIME
 	);
+
+	CREATE TABLE IF NOT EXISTS share_sessions (
+		token TEXT PRIMARY KEY,
+		share_token TEXT NOT NULL,
+		expires_at DATETIME NOT NULL
+	);
+	CREATE INDEX IF NOT EXISTS idx_share_sessions_share ON share_sessions(share_token);
+	CREATE INDEX IF NOT EXISTS idx_share_sessions_expires ON share_sessions(expires_at);
 
 	CREATE TABLE IF NOT EXISTS tg_sessions (
 		session_id TEXT PRIMARY KEY,
@@ -303,7 +322,21 @@ const sqliteSchema = `
 		PRIMARY KEY (username, key)
 	);
 
+	CREATE TABLE IF NOT EXISTS audit_log (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		ts DATETIME NOT NULL,
+		actor TEXT,
+		action TEXT NOT NULL,
+		target TEXT,
+		status TEXT,
+		ip TEXT,
+		ua TEXT
+	);
+	CREATE INDEX IF NOT EXISTS idx_audit_log_ts ON audit_log(ts);
+	CREATE INDEX IF NOT EXISTS idx_audit_log_actor ON audit_log(actor);
+
 	CREATE INDEX IF NOT EXISTS idx_files_path ON files(path);
+	CREATE INDEX IF NOT EXISTS idx_files_filename ON files(filename);
 	CREATE INDEX IF NOT EXISTS idx_files_owner_path ON files(owner, path, filename);
 	CREATE INDEX IF NOT EXISTS idx_files_message_id ON files(message_id);
 	CREATE INDEX IF NOT EXISTS idx_passkeys_username ON passkeys(username);
@@ -335,7 +368,17 @@ const mysqlSchema = `
 	CREATE TABLE IF NOT EXISTS sessions (
 		token VARCHAR(191) PRIMARY KEY,
 		created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-		username VARCHAR(191) DEFAULT ''
+		username VARCHAR(191) DEFAULT '',
+		expires_at DATETIME,
+		INDEX idx_sessions_expires (expires_at)
+	) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+	CREATE TABLE IF NOT EXISTS share_sessions (
+		token VARCHAR(191) PRIMARY KEY,
+		share_token VARCHAR(191) NOT NULL,
+		expires_at DATETIME NOT NULL,
+		INDEX idx_share_sessions_share (share_token),
+		INDEX idx_share_sessions_expires (expires_at)
 	) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 	CREATE TABLE IF NOT EXISTS tg_sessions (
@@ -403,6 +446,19 @@ const mysqlSchema = `
 		value TEXT NOT NULL,
 		PRIMARY KEY (username, ` + "`key`" + `)
 	) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+	CREATE TABLE IF NOT EXISTS audit_log (
+		id BIGINT PRIMARY KEY AUTO_INCREMENT,
+		ts DATETIME NOT NULL,
+		actor VARCHAR(191),
+		action VARCHAR(64) NOT NULL,
+		target VARCHAR(384),
+		status VARCHAR(32),
+		ip VARCHAR(64),
+		ua VARCHAR(512),
+		INDEX idx_audit_log_ts (ts),
+		INDEX idx_audit_log_actor (actor)
+	) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 `
 
 const postgresSchema = `
@@ -414,7 +470,7 @@ const postgresSchema = `
 		size BIGINT DEFAULT 0,
 		mime_type TEXT,
 		share_token TEXT UNIQUE,
-		is_folder SMALLINT DEFAULT 0,
+		is_folder BOOLEAN DEFAULT FALSE,
 		thumb_path TEXT,
 		owner TEXT DEFAULT '',
 		created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -430,8 +486,17 @@ const postgresSchema = `
 	CREATE TABLE IF NOT EXISTS sessions (
 		token TEXT PRIMARY KEY,
 		created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-		username TEXT DEFAULT ''
+		username TEXT DEFAULT '',
+		expires_at TIMESTAMP
 	);
+
+	CREATE TABLE IF NOT EXISTS share_sessions (
+		token TEXT PRIMARY KEY,
+		share_token TEXT NOT NULL,
+		expires_at TIMESTAMP NOT NULL
+	);
+	CREATE INDEX IF NOT EXISTS idx_share_sessions_share ON share_sessions(share_token);
+	CREATE INDEX IF NOT EXISTS idx_share_sessions_expires ON share_sessions(expires_at);
 
 	CREATE TABLE IF NOT EXISTS tg_sessions (
 		session_id TEXT PRIMARY KEY,
@@ -444,12 +509,12 @@ const postgresSchema = `
 		username TEXT UNIQUE NOT NULL,
 		password_hash TEXT NOT NULL,
 		api_key TEXT UNIQUE,
-		webdav_enabled SMALLINT DEFAULT 1,
-		api_enabled SMALLINT DEFAULT 1,
-		force_password_change SMALLINT DEFAULT 0,
+		webdav_enabled BOOLEAN DEFAULT TRUE,
+		api_enabled BOOLEAN DEFAULT TRUE,
+		force_password_change BOOLEAN DEFAULT FALSE,
 		s3_access_key TEXT UNIQUE,
 		s3_secret_key TEXT,
-		s3_enabled SMALLINT DEFAULT 1,
+		s3_enabled BOOLEAN DEFAULT TRUE,
 		created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 	);
 
@@ -462,8 +527,8 @@ const postgresSchema = `
 		aaguid BYTEA,
 		sign_count BIGINT DEFAULT 0,
 		transports TEXT,
-		backup_eligible SMALLINT DEFAULT 0,
-		backup_state SMALLINT DEFAULT 0,
+		backup_eligible BOOLEAN DEFAULT FALSE,
+		backup_state BOOLEAN DEFAULT FALSE,
 		name TEXT,
 		created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 	);
@@ -480,7 +545,7 @@ const postgresSchema = `
 		id TEXT PRIMARY KEY,
 		filename TEXT NOT NULL,
 		owner TEXT NOT NULL,
-		overwrite SMALLINT DEFAULT 0,
+		overwrite BOOLEAN DEFAULT FALSE,
 		created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 	);
 
@@ -498,7 +563,21 @@ const postgresSchema = `
 		PRIMARY KEY (username, key)
 	);
 
+	CREATE TABLE IF NOT EXISTS audit_log (
+		id BIGSERIAL PRIMARY KEY,
+		ts TIMESTAMP NOT NULL,
+		actor TEXT,
+		action TEXT NOT NULL,
+		target TEXT,
+		status TEXT,
+		ip TEXT,
+		ua TEXT
+	);
+	CREATE INDEX IF NOT EXISTS idx_audit_log_ts ON audit_log(ts);
+	CREATE INDEX IF NOT EXISTS idx_audit_log_actor ON audit_log(actor);
+
 	CREATE INDEX IF NOT EXISTS idx_files_path ON files(path);
+	CREATE INDEX IF NOT EXISTS idx_files_filename ON files(filename);
 	CREATE INDEX IF NOT EXISTS idx_files_owner_path ON files(owner, path, filename);
 	CREATE INDEX IF NOT EXISTS idx_files_message_id ON files(message_id);
 	CREATE INDEX IF NOT EXISTS idx_passkeys_username ON passkeys(username);
@@ -524,11 +603,23 @@ func migrateSQLite() error {
 	DB.Exec("ALTER TABLE child_accounts ADD COLUMN s3_enabled INTEGER DEFAULT 1")
 	DB.Exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_child_accounts_s3_key ON child_accounts(s3_access_key)")
 
+	DB.Exec("CREATE INDEX IF NOT EXISTS idx_files_path ON files(path)")
+	DB.Exec("CREATE INDEX IF NOT EXISTS idx_files_filename ON files(filename)")
 	DB.Exec("CREATE INDEX IF NOT EXISTS idx_files_owner_path ON files(owner, path, filename)")
 	DB.Exec("CREATE TABLE IF NOT EXISTS tg_sessions (session_id TEXT PRIMARY KEY, data BLOB NOT NULL, updated_at DATETIME DEFAULT CURRENT_TIMESTAMP)")
 	DB.Exec("ALTER TABLE upload_tasks ADD COLUMN overwrite BOOLEAN DEFAULT 0")
 	DB.Exec("ALTER TABLE files ADD COLUMN deleted_at DATETIME")
 	DB.Exec("ALTER TABLE files ADD COLUMN share_password TEXT")
+	// Sessions get an explicit expiry column so we can stop trusting tokens
+	// older than 30 days, even if the cookie was somehow retained.
+	DB.Exec("ALTER TABLE sessions ADD COLUMN expires_at DATETIME")
+	DB.Exec("CREATE INDEX IF NOT EXISTS idx_sessions_expires ON sessions(expires_at)")
+	// Backfill: assume any pre-existing row has 30 days from its created_at.
+	DB.Exec("UPDATE sessions SET expires_at = datetime(created_at, '+30 days') WHERE expires_at IS NULL")
+	// New share-session table (used by password-protected share links).
+	DB.Exec("CREATE TABLE IF NOT EXISTS share_sessions (token TEXT PRIMARY KEY, share_token TEXT NOT NULL, expires_at DATETIME NOT NULL)")
+	DB.Exec("CREATE INDEX IF NOT EXISTS idx_share_sessions_share ON share_sessions(share_token)")
+	DB.Exec("CREATE INDEX IF NOT EXISTS idx_share_sessions_expires ON share_sessions(expires_at)")
 	// Ensure foreign keys are enabled
 	DB.Exec("PRAGMA foreign_keys = ON")
 	return nil
@@ -592,6 +683,9 @@ func migrateMySQL() error {
 	if err := createIndexMySQL("idx_files_path", "files", "path", false); err != nil {
 		return err
 	}
+	if err := createIndexMySQL("idx_files_filename", "files", "filename", false); err != nil {
+		return err
+	}
 	if err := createIndexMySQL("idx_files_owner_path", "files", "owner, path, filename", false); err != nil {
 		return err
 	}
@@ -635,6 +729,16 @@ func migrateMySQL() error {
 	if err := alterTableMySQL("files", "ADD COLUMN share_password TEXT"); err != nil {
 		return err
 	}
+	if err := alterTableMySQL("sessions", "ADD COLUMN expires_at DATETIME"); err != nil {
+		return err
+	}
+	if err := createIndexMySQL("idx_sessions_expires", "sessions", "expires_at", false); err != nil {
+		return err
+	}
+	DB.Exec("UPDATE sessions SET expires_at = DATE_ADD(created_at, INTERVAL 30 DAY) WHERE expires_at IS NULL")
+	if _, err := DB.Exec("CREATE TABLE IF NOT EXISTS share_sessions (token VARCHAR(191) PRIMARY KEY, share_token VARCHAR(191) NOT NULL, expires_at DATETIME NOT NULL, INDEX idx_share_sessions_share (share_token), INDEX idx_share_sessions_expires (expires_at)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci"); err != nil {
+		return err
+	}
 
 	// Create user_settings if not exists (already in schema but for migration)
 	if _, err := DB.Exec("CREATE TABLE IF NOT EXISTS user_settings (username VARCHAR(191) NOT NULL, `key` VARCHAR(191) NOT NULL, value TEXT NOT NULL, PRIMARY KEY (username, `key`)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci"); err != nil {
@@ -645,6 +749,15 @@ func migrateMySQL() error {
 }
 
 func migratePostgres() error {
+	DB.Exec("CREATE INDEX IF NOT EXISTS idx_files_path ON files(path)")
+	DB.Exec("CREATE INDEX IF NOT EXISTS idx_files_filename ON files(filename)")
+	DB.Exec("CREATE INDEX IF NOT EXISTS idx_files_owner_path ON files(owner, path, filename)")
+	DB.Exec("ALTER TABLE sessions ADD COLUMN IF NOT EXISTS expires_at TIMESTAMP")
+	DB.Exec("CREATE INDEX IF NOT EXISTS idx_sessions_expires ON sessions(expires_at)")
+	DB.Exec("UPDATE sessions SET expires_at = created_at + INTERVAL '30 days' WHERE expires_at IS NULL")
+	DB.Exec(`CREATE TABLE IF NOT EXISTS share_sessions (token TEXT PRIMARY KEY, share_token TEXT NOT NULL, expires_at TIMESTAMP NOT NULL)`)
+	DB.Exec("CREATE INDEX IF NOT EXISTS idx_share_sessions_share ON share_sessions(share_token)")
+	DB.Exec("CREATE INDEX IF NOT EXISTS idx_share_sessions_expires ON share_sessions(expires_at)")
 	_, err := DB.Exec(`
 		CREATE UNIQUE INDEX IF NOT EXISTS idx_active_files
 		ON files (path, filename, owner)
@@ -710,7 +823,7 @@ func backfillOwners() error {
 	updateCmd := "UPDATE"
 	if IsMySQL() {
 		updateCmd = "UPDATE IGNORE"
-	} else {
+	} else if !IsPostgres() {
 		updateCmd = "UPDATE OR IGNORE"
 	}
 
@@ -743,6 +856,10 @@ func IsPostgres() bool {
 	return driverName == "postgres"
 }
 
+func IsSQLite() bool {
+	return driverName == "sqlite"
+}
+
 func InsertIgnoreSQL(table, columns, values string) string {
 	if IsMySQL() {
 		return fmt.Sprintf("INSERT IGNORE INTO %s (%s) VALUES (%s)", table, columns, values)
@@ -758,6 +875,48 @@ func ConcatPathSQL() string {
 		return "CONCAT(?, SUBSTR(path, ?))"
 	}
 	return "? || SUBSTR(path, ?)"
+}
+
+type DBExecer interface {
+	Exec(query string, args ...interface{}) (sql.Result, error)
+	QueryRowx(query string, args ...interface{}) *sqlx.Row
+}
+
+func InsertAndGetID(db DBExecer, query string, args ...interface{}) (int64, error) {
+	if IsPostgres() {
+		var id int64
+		err := db.QueryRowx(query+" RETURNING id", args...).Scan(&id)
+		return id, err
+	}
+
+	res, err := db.Exec(query, args...)
+	if err != nil {
+		return 0, err
+	}
+	return res.LastInsertId()
+}
+
+// fileInsertShards provides per-(owner,path) serialization for the
+// GetUniqueFilename → InsertAndGetID sequence.
+// Using 64 shards reduces contention while keeping memory usage constant.
+const fileInsertShards = 64
+
+var fileInsertMu [fileInsertShards]sync.Mutex
+
+// AcquireFileInsertLock returns an unlock function that must be deferred.
+// Call it before GetUniqueFilename and release after InsertAndGetID to
+// prevent TOCTOU duplicate-filename races, especially on MySQL which
+// lacks the partial unique index (WHERE deleted_at IS NULL).
+func AcquireFileInsertLock(owner, dirPath string) func() {
+	// FNV-1a hash of owner+path, folded into shard index.
+	h := uint32(2166136261)
+	for _, c := range owner + "|" + dirPath {
+		h ^= uint32(c)
+		h *= 16777619
+	}
+	mu := &fileInsertMu[h%fileInsertShards]
+	mu.Lock()
+	return mu.Unlock
 }
 
 type FilePart struct {
@@ -777,22 +936,57 @@ func GetFileParts(fileID int) ([]FilePart, error) {
 func GetSetting(key string) string {
 	var value string
 	query := "SELECT value FROM settings WHERE `key` = ?"
-	if !IsMySQL() {
+	if IsPostgres() {
+		query = "SELECT value FROM settings WHERE \"key\" = ?"
+	} else if !IsMySQL() {
 		query = "SELECT value FROM settings WHERE key = ?"
 	}
 	err := RODB.Get(&value, query, key)
 	if err != nil {
 		return ""
 	}
+	if IsSensitiveSetting(key) {
+		plain, derr := utils.DecryptString(value)
+		if derr != nil {
+			return ""
+		}
+		return plain
+	}
+	return value
+}
+
+// GetSettingRaw returns the stored value without attempting decryption.
+// Used by the encryption auto-migration so it can detect legacy plaintext rows.
+func GetSettingRaw(key string) string {
+	var value string
+	query := "SELECT value FROM settings WHERE `key` = ?"
+	if IsPostgres() {
+		query = "SELECT value FROM settings WHERE \"key\" = ?"
+	} else if !IsMySQL() {
+		query = "SELECT value FROM settings WHERE key = ?"
+	}
+	if err := RODB.Get(&value, query, key); err != nil {
+		return ""
+	}
 	return value
 }
 
 func SetSetting(key string, value string) error {
+	stored := value
+	if IsSensitiveSetting(key) && value != "" && !utils.IsEncryptedString(value) {
+		enc, err := utils.EncryptString(value)
+		if err != nil {
+			return err
+		}
+		stored = enc
+	}
 	query := "INSERT INTO settings (`key`, value) VALUES (?, ?) ON DUPLICATE KEY UPDATE value = VALUES(value)"
-	if !IsMySQL() {
+	if IsPostgres() {
+		query = "INSERT INTO settings (\"key\", value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = EXCLUDED.value"
+	} else if !IsMySQL() {
 		query = "INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value"
 	}
-	_, err := DB.Exec(query, key, value)
+	_, err := DB.Exec(query, key, stored)
 	return err
 }
 
@@ -813,7 +1007,9 @@ func SetTGSession(sessionID string, data []byte) error {
 
 func DeleteSetting(key string) error {
 	query := "DELETE FROM settings WHERE `key` = ?"
-	if !IsMySQL() {
+	if IsPostgres() {
+		query = "DELETE FROM settings WHERE \"key\" = ?"
+	} else if !IsMySQL() {
 		query = "DELETE FROM settings WHERE key = ?"
 	}
 	_, err := DB.Exec(query, key)
@@ -823,7 +1019,9 @@ func DeleteSetting(key string) error {
 func GetUserSetting(username string, key string) string {
 	var value string
 	query := "SELECT value FROM user_settings WHERE username = ? AND `key` = ?"
-	if !IsMySQL() {
+	if IsPostgres() {
+		query = "SELECT value FROM user_settings WHERE username = ? AND \"key\" = ?"
+	} else if !IsMySQL() {
 		query = "SELECT value FROM user_settings WHERE username = ? AND key = ?"
 	}
 	err := RODB.Get(&value, query, username, key)
@@ -835,7 +1033,9 @@ func GetUserSetting(username string, key string) string {
 
 func SetUserSetting(username string, key string, value string) error {
 	query := "INSERT INTO user_settings (username, `key`, value) VALUES (?, ?, ?) ON DUPLICATE KEY UPDATE value = VALUES(value)"
-	if !IsMySQL() {
+	if IsPostgres() {
+		query = "INSERT INTO user_settings (username, \"key\", value) VALUES (?, ?, ?) ON CONFLICT(username, \"key\") DO UPDATE SET value = EXCLUDED.value"
+	} else if !IsMySQL() {
 		query = "INSERT INTO user_settings (username, key, value) VALUES (?, ?, ?) ON CONFLICT(username, key) DO UPDATE SET value = excluded.value"
 	}
 	_, err := DB.Exec(query, username, key, value)

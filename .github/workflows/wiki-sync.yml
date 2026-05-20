@@ -1,0 +1,47 @@
+name: Sync Wiki
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'docs/**'
+      - 'readme.md'
+      - 'readme_en.md'
+
+jobs:
+  sync-wiki:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Prepare Wiki Files
+        run: |
+          mkdir wiki_temp
+          cp docs/*.md wiki_temp/
+          cp readme.md wiki_temp/Home.md
+          cp readme_en.md wiki_temp/Home-EN.md
+          
+          # Fix image paths to use absolute URLs from the main repo
+          sed -i 's|src="preview/|src="https://raw.githubusercontent.com/dabeecao/telecloud-go/main/preview/|g' wiki_temp/Home.md
+          sed -i 's|src="preview/|src="https://raw.githubusercontent.com/dabeecao/telecloud-go/main/preview/|g' wiki_temp/Home-EN.md
+          
+          # Fix language toggle links for Wiki structure
+          sed -i 's|(\./readme_en.md)|(Home-EN)|g' wiki_temp/Home.md
+          sed -i 's|(\./readme.md)|(Home)|g' wiki_temp/Home-EN.md
+          
+          # Fix documentation links (remove ./docs/ and .md extension for Wiki)
+          sed -i 's|(\./docs/|(|g' wiki_temp/*.md
+          sed -i 's|\.md)|)|g' wiki_temp/*.md
+
+      - name: Sync to Wiki
+        uses: Andrew-Chen-Wang/github-wiki-action@v4
+        with:
+          path: wiki_temp
+          strategy: clone
+          # GitHub Actions token is usually sufficient for public repos
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

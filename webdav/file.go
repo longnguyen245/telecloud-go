@@ -199,7 +199,7 @@ func (w *fileWriter) Close() error {
 
 		// Push to Telegram in background
 		go func() {
-			// Multi-part upload allows any size
+			defer os.Remove(w.tempPath)
 
 			// Detect MIME type from extension
 			mimeType := mime.TypeByExtension(filepath.Ext(w.filename))
@@ -208,7 +208,6 @@ func (w *fileWriter) Close() error {
 			}
 
 			tgclient.ProcessCompleteUpload(context.Background(), w.tempPath, w.filename, w.dir, mimeType, w.taskID, w.cfg, w.overwrite, w.owner)
-			os.Remove(w.tempPath)
 		}()
 	}
 	return nil

@@ -47,8 +47,8 @@ import (
 )
 
 //go:embed web/templates
-//go:embed web/static/css/*.min.css web/static/css/tailwind.css web/static/css/plyr.css web/static/css/prism.css
-//go:embed web/static/js/*.min.js web/static/js/plyr.polyfilled.js web/static/js/prism.js
+//go:embed web/static/css/*.min.css web/static/css/tailwind.css
+//go:embed web/static/js/*.min.js
 //go:embed web/static/themes/*.min.css
 //go:embed web/static/fonts web/static/webfonts
 //go:embed web/static/favicon.ico
@@ -79,7 +79,7 @@ func restartApp() {
 }
 
 var (
-	version = "v3.3.0-beta.1"
+	version = "v3.6.0"
 	commit  = "none"
 	date    = "unknown"
 )
@@ -123,6 +123,15 @@ func main() {
 	if err := database.InitDB(cfg.DatabaseDriver, cfg.DatabasePath, cfg.DatabaseDSN); err != nil {
 		fatalf("%v", err)
 	}
+
+	sqlitePath := ""
+	if cfg.DatabaseDriver == "" || cfg.DatabaseDriver == "sqlite" {
+		sqlitePath = cfg.DatabasePath
+	}
+	if err := database.MigrateEncryptV1(sqlitePath); err != nil {
+		fatalf("Encryption migration failed: %v", err)
+	}
+
 	cfg.LoadFromDB(database.GetSetting)
 
 	if *resetPassFlag {
@@ -162,12 +171,9 @@ func main() {
 			}
 		}
 	}
-	cryptoSecret := database.GetSetting("crypto_secret")
-	if cryptoSecret == "" {
-		cryptoSecret = uuid.New().String()
-		database.SetSetting("crypto_secret", cryptoSecret)
+	if err := utils.InitCrypto(); err != nil {
+		fatalf("%v", err)
 	}
-	utils.InitCrypto(cryptoSecret)
 	utils.InitMedia(cfg.ThumbsDir)
 
 	// Initialize WebAuthn (logic moved to api.InitWebAuthn for consistency)
@@ -175,10 +181,12 @@ func main() {
 
 	startCleanupTask(cfg)
 	startTrashCleanupTask(cfg)
-
+	startSessionCleanupTask()
 	// cancelCtx is used to signal the Telegram client to stop
 	appCtx, cancelApp := context.WithCancel(context.Background())
 	defer cancelApp()
+
+	tgclient.StartBackupTask(appCtx, cfg)
 
 	// Catch OS signals for graceful shutdown
 	sigCh := make(chan os.Signal, 1)
@@ -216,17 +224,34 @@ func main() {
 
 	router := api.SetupRouter(cfg, webFS, startTG, restartApp)
 
-	httpServer := &http.Server{
-		Addr:    ":" + cfg.Port,
-		Handler: router,
+	adminUser := database.GetSetting("admin_username")
+
+	listenAddr := cfg.ListenAddr
+	if listenAddr == "" {
+		// Pre-setup we bind to loopback only so the open /setup endpoint can't
+		// be reached by random scanners on the public IP.
+		if adminUser == "" {
+			listenAddr = "127.0.0.1"
+			log.Println("Setup not finished — binding to 127.0.0.1 only. Set LISTEN_ADDR=0.0.0.0 to override.")
+		} else {
+			listenAddr = "0.0.0.0"
+		}
 	}
 
-	adminUser := database.GetSetting("admin_username")
+	httpServer := &http.Server{
+		Addr:    listenAddr + ":" + cfg.Port,
+		Handler: router,
+	}
 	if cfg.APIID == 0 || cfg.APIHash == "" || adminUser == "" {
-		setupURL := fmt.Sprintf("http://YOUR_IP_OR_DOMAIN:%s/setup", cfg.Port)
+		setupHost := listenAddr
+		if setupHost == "0.0.0.0" || setupHost == "::" {
+			setupHost = "YOUR_IP_OR_DOMAIN"
+		}
+		setupURL := fmt.Sprintf("http://%s:%s/setup", setupHost, cfg.Port)
 		log.Printf("Setup is incomplete. Starting in Setup Mode. Please visit: %s", setupURL)
 		log.Println("Starting TeleCloud on port " + cfg.Port + "...")
 	} else {
+
 		startTG(cfg)
 	}
 
@@ -399,6 +424,29 @@ func truncateString(s string, maxLen int) string {
 		return s
 	}
 	return s[:maxLen-3] + "..."
+}
+
+// startSessionCleanupTask periodically deletes expired rows from the
+// sessions and share_sessions tables so they don't grow unbounded and so
+// stale tokens are evicted close to their actual expiry.
+func startSessionCleanupTask() {
+	go func() {
+		ticker := time.NewTicker(6 * time.Hour)
+		defer ticker.Stop()
+		// Run once on boot to catch anything left over from the previous run.
+		runOnce := func() {
+			if s, sh := database.CleanupExpiredSessions(); s > 0 || sh > 0 {
+				log.Printf("[Sessions] cleaned %d expired session(s), %d expired share session(s)", s, sh)
+			}
+			if a := database.CleanupExpiredAudit(); a > 0 {
+				log.Printf("[Audit] purged %d audit row(s) older than retention horizon", a)
+			}
+		}
+		runOnce()
+		for range ticker.C {
+			runOnce()
+		}
+	}()
 }
 
 func startCleanupTask(cfg *config.Config) {

@@ -1,5 +1,6 @@
 services:
   telecloud:
+    # NOTE: pin to a tagged version in production (e.g. ghcr.io/dabeecao/telecloud-go:v3.4.1)
     image: ghcr.io/dabeecao/telecloud-go:latest
     build:
       context: .
@@ -7,7 +8,11 @@ services:
     container_name: telecloud
     restart: unless-stopped
     ports:
-      - "${PORT:-8091}:8091"
+      # Bind to loopback only by default so the open /setup endpoint isn't
+      # reachable from the public Internet. Front this with a reverse proxy
+      # (Caddy/Nginx/Cloudflare Tunnel) or change "127.0.0.1" to "" / "0.0.0.0"
+      # if you intentionally want public access.
+      - "127.0.0.1:${PORT:-8091}:8091"
     env_file:
       - .env
     user: "65532:65532"
@@ -21,14 +26,17 @@ services:
       - FFMPEG_PATH=/usr/bin/ffmpeg
       - YTDLP_PATH=/usr/local/bin/yt-dlp
       - TORRENT_PATH=/usr/bin/aria2c
+      # Optional: 32-byte master key. If left blank, a secure 32-byte key is automatically
+      # generated and saved to /app/data/master.key inside the persistent volume.
+      # Put it in .env or uncomment here. Losing it means losing access to encrypted secrets.
+      # TELECLOUD_MASTER_KEY=
     volumes:
       # Persist database, thumbnails, temp files, and Telegram session
       - ./data:/app/data
-    # NOTE: distroless/static image has no shell or wget/curl,
-    # so CMD-SHELL healthchecks cannot work inside the container.
-    # Use an external monitoring tool or a sidecar container instead.
+    # NOTE: The runtime Docker image uses Alpine which includes 'wget',
+    # so you can uncomment this healthcheck if you want to monitor the container status.
     # healthcheck:
-    #   test: ["CMD-SHELL", "wget -qO- http://localhost:8091/ > /dev/null 2>&1 || exit 1"]
+    #   test: ["CMD-SHELL", "wget -qO- http://localhost:8091/ || exit 1"]
     #   interval: 30s
     #   timeout: 10s
     #   retries: 3

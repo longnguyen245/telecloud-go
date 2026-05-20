@@ -9,22 +9,39 @@ import (
 	"telecloud/database"
 	"telecloud/tgclient"
 	"telecloud/utils"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	"golang.org/x/crypto/bcrypt"
 )
 
+const shareSessionTTL = 24 * time.Hour
+
+// checkShareAuth returns true if either the share has no password or the
+// request carries a still-valid share_sessions row referenced by the cookie.
+// The bcrypt hash itself is never sent to the client.
 func (h *Handler) checkShareAuth(c *gin.Context, item database.File) bool {
 	if item.SharePassword == nil || *item.SharePassword == "" {
 		return true
 	}
 	token := c.Param("token")
 	authCookie, err := c.Cookie("share_auth_" + token)
-	if err == nil && authCookie == *item.SharePassword {
-		return true
+	if err != nil || authCookie == "" {
+		return false
 	}
-	return false
+	var expiresAt time.Time
+	err = database.RODB.Get(&expiresAt,
+		"SELECT expires_at FROM share_sessions WHERE token = ? AND share_token = ?",
+		authCookie, token)
+	if err != nil {
+		return false
+	}
+	if time.Now().After(expiresAt) {
+		database.DB.Exec("DELETE FROM share_sessions WHERE token = ?", authCookie)
+		return false
+	}
+	return true
 }
 
 func (h *Handler) handleVerifySharePassword(c *gin.Context) {
@@ -47,8 +64,23 @@ func (h *Handler) handleVerifySharePassword(c *gin.Context) {
 		return
 	}
 
-	// Set cookie with the hash as value for verification in other handlers
-	c.SetCookie("share_auth_"+token, *item.SharePassword, 3600*24, "/", "", false, true)
+	// Mint a single-purpose, opaque session token. The bcrypt hash never
+	// leaves the server, so an attacker who somehow obtains the password
+	// hash from the DB still cannot forge a cookie.
+	sessionToken := utils.GenerateRandomString(32)
+	if sessionToken == "" {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "token_generation_failed"})
+		return
+	}
+	expiresAt := time.Now().Add(shareSessionTTL)
+	if _, err := database.DB.Exec(
+		"INSERT INTO share_sessions (token, share_token, expires_at) VALUES (?, ?, ?)",
+		sessionToken, token, expiresAt,
+	); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "session_create_failed"})
+		return
+	}
+	c.SetCookie("share_auth_"+token, sessionToken, int(shareSessionTTL.Seconds()), "/", "", isSecure(), true)
 	c.JSON(http.StatusOK, gin.H{"status": "ok"})
 }
 

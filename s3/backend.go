@@ -2,9 +2,9 @@ package s3
 
 import (
 	"context"
-	"database/sql"
 	"fmt"
 	"io"
+	"mime"
 	"os"
 	"path"
 	"path/filepath"
@@ -273,11 +273,23 @@ func (b *TelecloudBackend) DeleteObject(bucketName, objectName string) (gofakes3
 
 	err := database.RODB.Get(&file, query, args...)
 	if err != nil {
-		return gofakes3.ObjectDeleteResult{}, nil
+		// S3 spec: DeleteObject is idempotent — return success even if not found.
+		return gofakes3.ObjectDeleteResult{IsDeleteMarker: false}, nil
 	}
 
-	now := time.Now()
-	database.DB.Exec("UPDATE files SET deleted_at = ? WHERE id = ?", now, file.ID)
+	// S3 semantics require permanent deletion — soft-delete would cause stale
+	// ListBucket results and leak Telegram messages for up to 30 days.
+	// Collect orphaned Telegram message IDs BEFORE removing DB rows.
+	msgIDsToDelete, _ := database.GetOrphanedMessages([]int{file.ID})
+
+	// Hard-delete from database.
+	database.DB.Exec("DELETE FROM files WHERE id = ?", file.ID)
+
+	// Clean up Telegram messages in background (non-blocking).
+	if len(msgIDsToDelete) > 0 {
+		go tgclient.DeleteMessages(context.Background(), b.cfg, msgIDsToDelete)
+	}
+
 	return gofakes3.ObjectDeleteResult{IsDeleteMarker: false}, nil
 }
 
@@ -327,7 +339,6 @@ func (b *TelecloudBackend) PutObject(bucketName, key string, meta map[string]str
 		return gofakes3.PutObjectResult{}, err
 	}
 	_, err = io.Copy(out, input)
-	out.Sync()
 	out.Close()
 	defer os.Remove(tempFilePath)
 
@@ -336,6 +347,14 @@ func (b *TelecloudBackend) PutObject(bucketName, key string, meta map[string]str
 	}
 
 	mimeType := meta["Content-Type"]
+	// Fallback to extension-based detection when S3 client omits Content-Type.
+	if mimeType == "" || mimeType == "application/octet-stream" {
+		if ext := filepath.Ext(filename); ext != "" {
+			if detected := mime.TypeByExtension(ext); detected != "" {
+				mimeType = detected
+			}
+		}
+	}
 	if mimeType == "" {
 		mimeType = "application/octet-stream"
 	}
@@ -375,26 +394,12 @@ func (b *TelecloudBackend) CopyObject(srcBucket, srcKey, dstBucket, dstKey strin
 	defer tx.Rollback()
 
 	// Perform the copy in database
-	var newFileID int64
-	var res sql.Result
-	err = nil
-	if database.IsPostgres() {
-		err = tx.QueryRowx(
-			"INSERT INTO files (message_id, filename, path, size, mime_type, is_folder, thumb_path, owner) VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING id",
-			file.MessageID, dstFilename, dstDbPath, file.Size, file.MimeType, file.IsFolder, file.ThumbPath, b.username,
-		).Scan(&newFileID)
-	} else {
-		res, err = tx.Exec(
-			"INSERT INTO files (message_id, filename, path, size, mime_type, is_folder, thumb_path, owner) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-			file.MessageID, dstFilename, dstDbPath, file.Size, file.MimeType, file.IsFolder, file.ThumbPath, b.username,
-		)
-	}
+	newFileID, err := database.InsertAndGetID(tx,
+		"INSERT INTO files (message_id, filename, path, size, mime_type, is_folder, thumb_path, owner) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+		file.MessageID, dstFilename, dstDbPath, file.Size, file.MimeType, file.IsFolder, file.ThumbPath, b.username,
+	)
 	if err != nil {
 		return gofakes3.CopyObjectResult{}, err
-	}
-
-	if !database.IsPostgres() {
-		newFileID, _ = res.LastInsertId()
 	}
 	if !file.IsFolder {
 		_, err = tx.Exec("INSERT INTO file_parts (file_id, part_index, message_id, size) SELECT ?, part_index, message_id, size FROM file_parts WHERE file_id = ?", newFileID, file.ID)

@@ -18,6 +18,12 @@ import (
 	"time"
 )
 
+var (
+	progressRegex    = regexp.MustCompile(`\[#([0-9a-f]+)\s+.*?([0-9.]+[KMG]?i?B)/([0-9.]+[KMG]?i?B)(?:\((\d+)%\))?`)
+	speedRegex       = regexp.MustCompile(`(?i)DL:([0-9.]+[KMG]?i?B)`)
+	torrentNameRegex = regexp.MustCompile(`(?i)(?:NOTICE:.*(?:'(.+?)'|complete:\s+(.+))|\[#[0-9a-f]+\s+([^|\]]+)\||^FILE:\s+(.+))`)
+)
+
 // IsValidTorrentInput validates magnet links and .torrent URLs.
 func IsValidTorrentInput(input string) bool {
 	input = strings.TrimSpace(input)
@@ -36,13 +42,27 @@ func IsValidTorrentInput(input string) bool {
 // - Single-file torrent: uploads to `path` directly.
 // - Multi-file torrent: creates a sub-folder named after the torrent, uploads all files inside.
 func ProcessTorrentUpload(ctx context.Context, input, path, taskID string, cfg *config.Config, owner string) {
+	torrentCtx, cancel := context.WithTimeout(ctx, 48*time.Hour)
+	defer cancel()
+
+	// Register for cancellation immediately so user can cancel while in queue
+	taskMutex.Lock()
+	TaskCancels[taskID] = cancel
+	taskMutex.Unlock()
+	defer func() {
+		taskMutex.Lock()
+		delete(TaskCancels, taskID)
+		taskMutex.Unlock()
+	}()
+
 	UpdateTask(taskID, "waiting_slot", 0, "waiting_slot", owner)
 
 	// Wait for a slot in the global download queue
 	select {
 	case globalDownloadSemaphore <- struct{}{}:
 		defer func() { <-globalDownloadSemaphore }()
-	case <-ctx.Done():
+	case <-torrentCtx.Done():
+		UpdateTask(taskID, "error", 0, "cancelled", owner)
 		return
 	}
 
@@ -63,19 +83,6 @@ func ProcessTorrentUpload(ctx context.Context, input, path, taskID string, cfg *
 		UpdateTaskWithFile(taskID, "error", 0, "torrent_temp_dir_failed", "", owner, 0, 0)
 		return
 	}
-
-	torrentCtx, cancel := context.WithTimeout(ctx, 48*time.Hour)
-	defer cancel()
-
-	// Register for cancellation
-	taskMutex.Lock()
-	TaskCancels[taskID] = cancel
-	taskMutex.Unlock()
-	defer func() {
-		taskMutex.Lock()
-		delete(TaskCancels, taskID)
-		taskMutex.Unlock()
-	}()
 	defer os.RemoveAll(torrentTempDir)
 
 	// Build aria2c arguments
@@ -96,11 +103,11 @@ func ProcessTorrentUpload(ctx context.Context, input, path, taskID string, cfg *
 		input,
 	}
 
-	// 2-hour timeout for the aria2c process
-	torrentCtx, cancelTimeout := context.WithTimeout(ctx, 2*time.Hour)
+	// 2-hour timeout for the aria2c process (as a child of 48-hour torrentCtx to ensure cancellation propagates)
+	torrentCmdCtx, cancelTimeout := context.WithTimeout(torrentCtx, 2*time.Hour)
 	defer cancelTimeout()
 
-	cmd := exec.CommandContext(torrentCtx, cfg.TorrentPath, args...)
+	cmd := exec.CommandContext(torrentCmdCtx, cfg.TorrentPath, args...)
 	cmd.Env = os.Environ()
 	setProcessGroup(cmd)
 
@@ -122,20 +129,9 @@ func ProcessTorrentUpload(ctx context.Context, input, path, taskID string, cfg *
 
 	// Kill whole process group on context cancellation
 	go func() {
-		<-torrentCtx.Done()
+		<-torrentCmdCtx.Done()
 		killProcessGroup(cmd)
 	}()
-
-	// aria2c progress line example:
-	//  [#abc123 1.2GiB/4.5GiB(26%) CN:4 DL:5.2MiB ETA:10m]
-	// Flexible to match both summary and live readout formats
-	progressRegex := regexp.MustCompile(`\[#([0-9a-f]+)\s+.*?([0-9.]+[KMG]?i?B)/([0-9.]+[KMG]?i?B)(?:\((\d+)%\))?`)
-	speedRegex := regexp.MustCompile(`(?i)DL:([0-9.]+[KMG]?i?B)`)
-	// Capture torrent name from: 
-	// 1. NOTICE: ... 'Name' OR complete: Name
-	// 2. [#abc GID Name|...]
-	// 3. FILE: /path/to/Name
-	torrentNameRegex := regexp.MustCompile(`(?i)(?:NOTICE:.*(?:'(.+?)'|complete:\s+(.+))|\[#[0-9a-f]+\s+([^|\]]+)\||^FILE:\s+(.+))`)
 
 	lastPercent := -1
 	lastTotalSize := int64(0)
@@ -319,9 +315,9 @@ func ProcessTorrentUpload(ctx context.Context, input, path, taskID string, cfg *
 	}
 
 	if err := cmd.Wait(); err != nil {
-		if ctx.Err() != nil || torrentCtx.Err() != nil {
+		if torrentCtx.Err() != nil || torrentCmdCtx.Err() != nil {
 			statusMsg := "cancelled"
-			if torrentCtx.Err() == context.DeadlineExceeded {
+			if torrentCmdCtx.Err() == context.DeadlineExceeded {
 				statusMsg = "torrent_timeout"
 			}
 			UpdateTask(taskID, "error", 0, statusMsg, owner)
@@ -379,7 +375,7 @@ func ProcessTorrentUpload(ctx context.Context, input, path, taskID string, cfg *
 
 	total := len(allFiles)
 	for i, filePath := range allFiles {
-		if ctx.Err() != nil {
+		if torrentCtx.Err() != nil {
 			return
 		}
 
@@ -418,7 +414,7 @@ func ProcessTorrentUpload(ctx context.Context, input, path, taskID string, cfg *
 		// Register the sub-task with its name and size so it appears immediately
 		UpdateTaskWithSpeed(subTaskID, "telegram", 0, msg, filename, owner, fSize, 0, 0)
 
-		ProcessCompleteUpload(ctx, filePath, filename, subDestPath, detectMIME(filename), subTaskID, cfg, false, owner)
+		ProcessCompleteUpload(torrentCtx, filePath, filename, subDestPath, detectMIME(filename), subTaskID, cfg, false, owner)
 	}
 }
 

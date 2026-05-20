@@ -2,6 +2,8 @@ package webdav
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"log"
 	"net/http"
 	"strings"
@@ -17,15 +19,114 @@ import (
 
 // webdavAuthCache lưu kết quả bcrypt để tránh gọi lại mỗi request
 type authCacheEntry struct {
+	user      string
 	hash      string
 	validated bool
 	expiresAt time.Time
 }
 
-var (
-	authCache   sync.Map // map[string]*authCacheEntry keyed by password
-	authCacheTTL = 10 * time.Minute
+type failedAttempt struct {
+	count int
+	last  time.Time
+}
+
+const (
+	authCacheTTL          = 2 * time.Minute
+	failedAttemptMax      = 5
+	failedAttemptWindow   = 15 * time.Minute
+	failedAttemptBackoff  = 100 * time.Millisecond
 )
+
+var (
+	// authCache stores successful auth results, keyed by user|sha256(pass)|hash.
+	// The plaintext password is never stored here — only its SHA-256 — so a
+	// core/memory dump cannot leak credentials.
+	authCache sync.Map
+
+	// failedAuthAttempts tracks consecutive failures per remote IP. Hitting
+	// the threshold yields 401 with a short backoff to slow brute force.
+	failedAuthAttempts sync.Map
+)
+
+// authCacheKey hashes the password so we never keep plaintext credentials in
+// process memory. Hash is bound to the user and the stored bcrypt hash so a
+// password change invalidates the entry naturally.
+func authCacheKey(user, pass, dbHash string) string {
+	sum := sha256.Sum256([]byte(pass))
+	return user + "|" + hex.EncodeToString(sum[:]) + "|" + dbHash
+}
+
+// InvalidateCache removes all cache entries for the given user. Called when
+// the user's password is rotated so an old session cannot ride out the TTL.
+func InvalidateCache(user string) {
+	authCache.Range(func(k, v interface{}) bool {
+		entry := v.(*authCacheEntry)
+		if entry.user == user {
+			authCache.Delete(k)
+		}
+		return true
+	})
+}
+
+// clientIP extracts the best-effort remote IP. Honors X-Forwarded-For /
+// X-Real-IP only when set by a trusted reverse proxy; for direct connections
+// it falls back to the peer address. NOT a substitute for real proxy
+// authentication, but enough to make per-IP rate limiting work behind a sane
+// front-end.
+func clientIP(r *http.Request) string {
+	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
+		if comma := strings.IndexByte(xff, ','); comma >= 0 {
+			return strings.TrimSpace(xff[:comma])
+		}
+		return strings.TrimSpace(xff)
+	}
+	if xri := r.Header.Get("X-Real-IP"); xri != "" {
+		return strings.TrimSpace(xri)
+	}
+	// Strip port from RemoteAddr ("1.2.3.4:5678" -> "1.2.3.4").
+	host := r.RemoteAddr
+	if i := strings.LastIndexByte(host, ':'); i > 0 && strings.IndexByte(host, '.') > 0 {
+		host = host[:i]
+	}
+	return host
+}
+
+func bumpFailed(ip string) (blocked bool) {
+	v, _ := failedAuthAttempts.Load(ip)
+	var att failedAttempt
+	if v != nil {
+		att = v.(failedAttempt)
+	}
+	if att.count >= failedAttemptMax && time.Since(att.last) < failedAttemptWindow {
+		return true
+	}
+	att.count++
+	att.last = time.Now()
+	failedAuthAttempts.Store(ip, att)
+	if att.count >= failedAttemptMax {
+		log.Printf("WEBDAV: rate-limit triggered for %s after %d failed attempts", ip, att.count)
+	}
+	return att.count >= failedAttemptMax
+}
+
+func checkBlocked(ip string) bool {
+	v, _ := failedAuthAttempts.Load(ip)
+	if v == nil {
+		return false
+	}
+	att := v.(failedAttempt)
+	if att.count >= failedAttemptMax && time.Since(att.last) < failedAttemptWindow {
+		return true
+	}
+	if att.count >= failedAttemptMax {
+		failedAuthAttempts.Delete(ip)
+	}
+	return false
+}
+
+func clearFailed(ip string) {
+	failedAuthAttempts.Delete(ip)
+}
 
 
 func NewHandler(cfg *config.Config) http.Handler {
@@ -51,13 +152,20 @@ func NewHandler(cfg *config.Config) http.Handler {
 			return
 		}
 
+		ip := clientIP(r)
+		if checkBlocked(ip) {
+			w.Header().Set("Retry-After", "900")
+			http.Error(w, "Too many failed attempts", http.StatusTooManyRequests)
+			return
+		}
+
 		user, pass, ok := r.BasicAuth()
 		if !ok {
 			w.Header().Set("WWW-Authenticate", `Basic realm="TeleCloud WebDAV"`)
 			http.Error(w, "Unauthorized", http.StatusUnauthorized)
 			return
 		}
-		
+
 		adminUser := database.GetSetting("admin_username")
 		adminHash := database.GetSetting("admin_password_hash")
 
@@ -77,6 +185,7 @@ func NewHandler(cfg *config.Config) http.Handler {
 			}
 			err := database.RODB.Get(&userStatus, "SELECT password_hash, webdav_enabled, force_password_change FROM child_accounts WHERE username = ?", user)
 			if err != nil {
+				bumpFailed(ip)
 				w.Header().Set("WWW-Authenticate", `Basic realm="TeleCloud WebDAV"`)
 				http.Error(w, "Unauthorized", http.StatusUnauthorized)
 				return
@@ -90,11 +199,12 @@ func NewHandler(cfg *config.Config) http.Handler {
 				return
 			}
 			dbHash = userStatus.PasswordHash
-
 		}
 
-		// Kiểm tra cache trước khi gọi bcrypt (tốn ~100ms/lần)
-		cacheKey := user + "|" + pass + "|" + dbHash
+		// Cache lookup uses sha256(pass) so plaintext credentials never sit in
+		// process memory. Cache TTL is intentionally short (authCacheTTL) so a
+		// recently-rotated password takes effect quickly.
+		cacheKey := authCacheKey(user, pass, dbHash)
 		if v, ok := authCache.Load(cacheKey); ok {
 			entry := v.(*authCacheEntry)
 			if time.Now().Before(entry.expiresAt) && entry.hash == dbHash {
@@ -108,8 +218,8 @@ func NewHandler(cfg *config.Config) http.Handler {
 			err := bcrypt.CompareHashAndPassword([]byte(dbHash), []byte(pass))
 			if err == nil {
 				authed = true
-				// Chỉ cache kết quả auth thành công (không cache mật khẩu sai)
 				authCache.Store(cacheKey, &authCacheEntry{
+					user:      user,
 					hash:      dbHash,
 					validated: true,
 					expiresAt: time.Now().Add(authCacheTTL),
@@ -118,10 +228,17 @@ func NewHandler(cfg *config.Config) http.Handler {
 		}
 
 		if !authed {
+			if bumpFailed(ip) {
+				// Add a small backoff to slow brute force even before the limit
+				// hits, without making the legitimate retry path unbearable.
+				time.Sleep(failedAttemptBackoff)
+			}
 			w.Header().Set("WWW-Authenticate", `Basic realm="TeleCloud WebDAV"`)
 			http.Error(w, "Unauthorized", http.StatusUnauthorized)
 			return
 		}
+
+		clearFailed(ip)
 
 		// Store user info in context
 		ctx := context.WithValue(r.Context(), usernameKey, user)

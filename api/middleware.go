@@ -80,6 +80,35 @@ func csrfMiddleware() gin.HandlerFunc {
 	}
 }
 
+
+// buildCSP returns a Content-Security-Policy whose third-party allow-lists
+// follow runtime settings. Cloudflare Web Analytics (cloudflareinsights.com)
+// is opt-in: it is only included when the operator flips analytics_enabled,
+// so a default deployment doesn't leak page-view telemetry to a CDN.
+//
+// 'unsafe-inline' and 'unsafe-eval' remain in script-src because the
+// frontend uses Alpine.js, which needs them. Documented in README.
+func buildCSP() string {
+	scriptSrc := "'self' 'unsafe-inline' 'unsafe-eval' https://cdnjs.cloudflare.com"
+	connectSrc := "'self' https://api.github.com https://cdn.plyr.io"
+
+	if database.GetSetting("analytics_enabled") == "true" {
+		scriptSrc += " https://static.cloudflareinsights.com"
+		connectSrc += " https://cloudflareinsights.com"
+	}
+
+	return strings.Join([]string{
+		"default-src 'self'",
+		"script-src " + scriptSrc,
+		"style-src 'self' 'unsafe-inline' https://cdnjs.cloudflare.com https://fonts.googleapis.com",
+		"font-src 'self' https://cdnjs.cloudflare.com https://fonts.gstatic.com",
+		"img-src 'self' data: *",
+		"connect-src " + connectSrc,
+		"media-src 'self' blob: * https://cdn.plyr.io",
+		"object-src 'self'",
+	}, "; ") + ";"
+}
+
 // securityHeadersMiddleware adds standard security headers to prevent common web attacks.
 func securityHeadersMiddleware() gin.HandlerFunc {
 	return func(c *gin.Context) {
@@ -88,8 +117,7 @@ func securityHeadersMiddleware() gin.HandlerFunc {
 		c.Header("X-XSS-Protection", "1; mode=block")
 		c.Header("Cross-Origin-Resource-Policy", "cross-origin")
 		c.Header("Cross-Origin-Opener-Policy", "same-origin-allow-popups")
-		// Basic Content Security Policy
-		c.Header("Content-Security-Policy", "default-src 'self'; script-src 'self' 'unsafe-inline' 'unsafe-eval' https://cdnjs.cloudflare.com https://static.cloudflareinsights.com; style-src 'self' 'unsafe-inline' https://cdnjs.cloudflare.com https://fonts.googleapis.com; font-src 'self' https://cdnjs.cloudflare.com https://fonts.gstatic.com; img-src 'self' data: *; connect-src 'self' https://api.github.com https://cloudflareinsights.com https://cdn.plyr.io; media-src 'self' blob: * https://cdn.plyr.io; object-src 'self';")
+		c.Header("Content-Security-Policy", buildCSP())
 		c.Next()
 	}
 }
@@ -127,10 +155,7 @@ func setupCheckMiddleware() gin.HandlerFunc {
 
 		if isSetupEndpoint {
 			token, _ := c.Cookie("session_token")
-			var sessionUsername string
-			if token != "" {
-				database.RODB.Get(&sessionUsername, "SELECT username FROM sessions WHERE token = ?", token)
-			}
+			sessionUsername := database.LookupSessionUser(token)
 
 			// Only admin can access setup once it's configured
 			if sessionUsername != adminUser {
@@ -168,10 +193,7 @@ func setupCheckMiddleware() gin.HandlerFunc {
 			}
 
 			token, _ := c.Cookie("session_token")
-			var sessionUsername string
-			if token != "" {
-				database.RODB.Get(&sessionUsername, "SELECT username FROM sessions WHERE token = ?", token)
-			}
+			sessionUsername := database.LookupSessionUser(token)
 
 			if sessionUsername == "" {
 				c.Redirect(http.StatusFound, "/login")
@@ -204,16 +226,14 @@ func authMiddleware() gin.HandlerFunc {
 		var isAdmin bool
 		var forceChange bool
 
-		token, err := c.Cookie("session_token")
-		if err == nil && token != "" {
-			err = database.RODB.Get(&sessionUsername, "SELECT username FROM sessions WHERE token = ?", token)
-			if err == nil {
-				adminUser := database.GetSetting("admin_username")
-				isAdmin = sessionUsername == adminUser
+		token, _ := c.Cookie("session_token")
+		sessionUsername = database.LookupSessionUser(token)
+		if sessionUsername != "" {
+			adminUser := database.GetSetting("admin_username")
+			isAdmin = sessionUsername == adminUser
 
-				if !isAdmin {
-					database.RODB.Get(&forceChange, "SELECT force_password_change FROM child_accounts WHERE username = ?", sessionUsername)
-				}
+			if !isAdmin {
+				database.RODB.Get(&forceChange, "SELECT force_password_change FROM child_accounts WHERE username = ?", sessionUsername)
 			}
 		}
 

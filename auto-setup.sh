@@ -93,6 +93,34 @@ pkg_install() {
     esac
 }
 
+# Hàm xác thực SHA256 của file. Trả về 0 nếu khớp, 1 nếu không.
+# Sử dụng: verify_sha256 <file_path> <expected_sha256_hex>
+verify_sha256() {
+    local file="$1"
+    local expected="$2"
+    if [ -z "$expected" ]; then
+        echo "[!] Không có giá trị SHA256 mong đợi cho $file — bỏ qua kiểm tra."
+        return 1
+    fi
+    local actual=""
+    if command -v sha256sum &>/dev/null; then
+        actual=$(sha256sum "$file" | awk '{print $1}')
+    elif command -v shasum &>/dev/null; then
+        actual=$(shasum -a 256 "$file" | awk '{print $1}')
+    else
+        echo "[!] Không tìm thấy sha256sum hoặc shasum — không thể xác thực checksum."
+        return 1
+    fi
+    if [ "$actual" != "$expected" ]; then
+        echo "[!] CHECKSUM SAI cho $file"
+        echo "    Mong đợi: $expected"
+        echo "    Thực tế : $actual"
+        return 1
+    fi
+    echo "[✓] Đã xác thực SHA256 cho $(basename "$file")"
+    return 0
+}
+
 # Hàm tải file hỗ trợ fallback wget/curl và retry
 download_file() {
     local url="$1"
@@ -201,7 +229,7 @@ install_dependencies() {
 
     if [ "$OS_TYPE" == "linux" ]; then
         # Cài lần lượt, bỏ qua gói đã có
-        for pkg in curl wget tar unzip jq tmux nano procps; do
+        for pkg in curl wget tar unzip jq tmux nano procps lsof; do
             pkg_install "$pkg"
         done
 
@@ -271,7 +299,7 @@ install_dependencies() {
         echo "[!] yt-dlp cho phép tải video/audio từ YouTube, Facebook, TikTok..."
         read -p "[?] Bạn có muốn cài đặt yt-dlp không? (y/n): " install_ytdlp
 
-        MAIN_PACKAGES="wget curl tar unzip tmux jq nano python procps"
+        MAIN_PACKAGES="wget curl tar unzip tmux jq nano python procps lsof"
         [ "${TUNNEL_METHOD:-}" == "cloudflare" ] && MAIN_PACKAGES="$MAIN_PACKAGES cloudflared"
         [ "$install_ffmpeg" == "y" ] && MAIN_PACKAGES="$MAIN_PACKAGES ffmpeg"
 
@@ -332,6 +360,31 @@ download_telecloud() {
 
     echo "[+] Đang tải phiên bản $VERSION..."
     download_file "$URL" telecloud.tar.gz || return 1
+
+    # Xác thực checksums.txt (do GoReleaser sinh tự động)
+    CHECKSUMS_URL=$(echo "$API_DATA" | jq -r '.assets[] | select(.name == "checksums.txt") | .browser_download_url' | head -n 1)
+    if [ -n "$CHECKSUMS_URL" ] && [ "$CHECKSUMS_URL" != "null" ]; then
+        download_file "$CHECKSUMS_URL" telecloud-checksums.txt || {
+            echo "[!] Không tải được checksums.txt — TỪ CHỐI cài để tránh binary giả mạo."
+            rm -f telecloud.tar.gz
+            return 1
+        }
+        EXPECTED_SHA=$(grep "$(basename "$URL")" telecloud-checksums.txt | awk '{print $1}' | head -n 1)
+        if ! verify_sha256 telecloud.tar.gz "$EXPECTED_SHA"; then
+            echo "[!] TỪ CHỐI cài đặt do checksum không khớp."
+            rm -f telecloud.tar.gz telecloud-checksums.txt
+            return 1
+        fi
+        rm -f telecloud-checksums.txt
+    else
+        echo "[!] CẢNH BÁO: Release $VERSION không có checksums.txt — không thể xác thực binary."
+        read -p "[?] Vẫn tiếp tục cài? (y/n): " confirm_no_sum
+        if [ "$confirm_no_sum" != "y" ]; then
+            rm -f telecloud.tar.gz
+            return 1
+        fi
+    fi
+
     mkdir -p "$BASE_DIR"
     tar -xzf telecloud.tar.gz -C "$BASE_DIR" || { echo "[!] Giải nén thất bại!"; return 1; }
 
@@ -348,6 +401,19 @@ download_telecloud() {
 # =============================
 # 4. CẤU HÌNH .ENV
 # =============================
+gen_random_hex() {
+    local len="${1:-32}"
+    if command -v openssl &>/dev/null; then
+        openssl rand -hex "$len"
+    elif [ -r /dev/urandom ]; then
+        LC_ALL=C tr -dc '0-9a-f' < /dev/urandom | head -c $((len * 2))
+        echo
+    else
+        echo "[!] Không tìm thấy openssl hoặc /dev/urandom để sinh khóa ngẫu nhiên!"
+        return 1
+    fi
+}
+
 create_env() {
     if [ ! -f "$BASE_DIR/.env" ]; then
         echo "[+] Thiết lập cấu hình .env..."
@@ -355,10 +421,16 @@ create_env() {
         read -p "Cổng PORT [Mặc định 8091]: " PORT
         PORT=${PORT:-8091}
 
+        MASTER_KEY=$(gen_random_hex 32) || return 1
+
         cat > "$BASE_DIR/.env" <<EOF
 PORT=$PORT
+LISTEN_ADDR=127.0.0.1
+
+# Khóa master mã hóa session và settings nhạy cảm (Tự động sinh nếu để trống)
+TELECLOUD_MASTER_KEY=$MASTER_KEY
 EOF
-        
+
         if command -v ffmpeg &> /dev/null; then
             echo "FFMPEG_PATH=ffmpeg" >> "$BASE_DIR/.env"
         else
@@ -379,6 +451,16 @@ EOF
 
         chmod 600 "$BASE_DIR/.env"
         echo "✅ Đã lưu cấu hình .env"
+        echo ""
+        echo "=================================================================="
+        echo "⚠️  HÃY SAO LƯU MASTER KEY DƯỚI ĐÂY VÀO TRÌNH QUẢN LÝ MẬT KHẨU!"
+        echo "    Mất key này = mất quyền giải mã Telegram session và secrets."
+        echo "    TELECLOUD_MASTER_KEY=$MASTER_KEY"
+        echo "------------------------------------------------------------------"
+        echo "🔑 Mở trình duyệt tại:"
+        echo "    http://127.0.0.1:$PORT/setup"
+        echo "=================================================================="
+        echo ""
     fi
 }
 
@@ -424,6 +506,32 @@ create_run_scripts() {
 
     # Tạo systemd service cho Linux có systemd
     if [ "$OS_TYPE" == "linux" ] && command -v systemctl &>/dev/null; then
+        # Tạo user 'telecloud' không-shell để chạy service (sandbox + bảo mật)
+        if ! getent passwd telecloud >/dev/null 2>&1; then
+            useradd --system --no-create-home --home-dir "$BASE_DIR" --shell /usr/sbin/nologin telecloud \
+                || useradd --system --no-create-home --home-dir "$BASE_DIR" --shell /bin/false telecloud \
+                || echo "[!] Không tạo được user 'telecloud' — service sẽ chạy với DynamicUser."
+        fi
+
+        # Kiểm tra xem thư mục cài đặt có nằm trong thư mục hạn chế truy cập như /root không
+        local use_root_service=0
+        if [[ "$BASE_DIR" == "/root"* ]]; then
+            use_root_service=1
+        fi
+
+        # Đảm bảo data/log/temp của BASE_DIR thuộc về user telecloud (nếu tạo thành công)
+        if [ $use_root_service -eq 1 ]; then
+            echo "[!] CẢNH BÁO: Thư mục cài đặt nằm trong /root."
+            echo "    Để tránh lỗi phân quyền (CHDIR / Permission Denied) của systemd,"
+            echo "    dịch vụ sẽ được chạy với quyền User=root."
+            SERVICE_USER_LINES=$'User=root\nGroup=root'
+        elif getent passwd telecloud >/dev/null 2>&1; then
+            chown -R telecloud:telecloud "$BASE_DIR" 2>/dev/null || true
+            SERVICE_USER_LINES=$'User=telecloud\nGroup=telecloud'
+        else
+            SERVICE_USER_LINES='DynamicUser=true'
+        fi
+
         cat > /etc/systemd/system/telecloud.service <<EOF
 [Unit]
 Description=Telecloud Go Service
@@ -431,10 +539,29 @@ After=network.target
 
 [Service]
 Type=simple
+$SERVICE_USER_LINES
 WorkingDirectory=$BASE_DIR
+EnvironmentFile=$BASE_DIR/.env
 ExecStart=$BASE_DIR/telecloud
 Restart=always
 RestartSec=3
+
+# Hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+RestrictNamespaces=true
+LockPersonality=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+ReadWritePaths=$BASE_DIR
 
 [Install]
 WantedBy=multi-user.target
@@ -450,9 +577,18 @@ After=network.target
 
 [Service]
 Type=simple
+DynamicUser=true
 ExecStart=$(command -v cloudflared) tunnel run --url http://localhost:$APP_PORT $TUNNEL_NAME
 Restart=always
 RestartSec=3
+
+# Hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+RestrictSUIDSGID=true
+LockPersonality=true
 
 [Install]
 WantedBy=multi-user.target
@@ -666,22 +802,28 @@ start_app() {
     echo "[+] Đang khởi động ứng dụng..."
     if [ "$OS_TYPE" == "linux" ]; then
         if command -v systemctl &>/dev/null; then
+            local start_time=$(date +"%Y-%m-%d %H:%M:%S")
             [ -f /etc/systemd/system/telecloud.service ] && systemctl enable --now telecloud || true
             [ -f /etc/systemd/system/telecloud-tunnel.service ] && [ -f "$BASE_DIR/tunnel.txt" ] && systemctl enable --now telecloud-tunnel || true
             
             echo "[+] Đang kiểm tra trạng thái khởi động (tối đa 30s)..."
-            sleep 2
-            local timeout=28
+            local timeout=30
             local success=0
             while [ $timeout -gt 0 ]; do
-                if journalctl -u telecloud.service -n 50 | grep -q "Starting TeleCloud on port"; then
+                # 1. Kiểm tra nếu cổng đã mở (Rất tin cậy)
+                if is_app_running "$BASE_DIR/telecloud"; then
                     success=1; break
                 fi
-                if journalctl -u telecloud.service -n 50 | grep -q "TeleCloud shut down"; then
+                # 2. Kiểm tra log để xem có báo lỗi shut down không (dùng --since "-1m" để bao quát)
+                if journalctl -u telecloud.service --since "-1m" 2>/dev/null | grep -q "TeleCloud shut down"; then
                     success=2; break
                 fi
-                # Kiểm tra nếu service đã chết (failed/inactive)
-                if ! systemctl is-active --quiet telecloud; then
+                # 3. Kiểm tra nếu service bị lỗi khởi động lặp (auto-restart) hoặc failed hẳn
+                local active_state=$(systemctl show -p ActiveState telecloud 2>/dev/null | cut -d'=' -f2)
+                local sub_state=$(systemctl show -p SubState telecloud 2>/dev/null | cut -d'=' -f2)
+                local n_restarts=$(systemctl show -p NRestarts telecloud 2>/dev/null | cut -d'=' -f2)
+
+                if [ "$sub_state" == "auto-restart" ] || { [ "$active_state" == "failed" ] && [ "$sub_state" == "failed" ]; } || { [ -n "$n_restarts" ] && [ "$n_restarts" -gt 2 ] && [ "$active_state" != "active" ]; }; then
                     success=3; break
                 fi
                 sleep 1
@@ -691,10 +833,13 @@ start_app() {
             if [ $success -eq 1 ]; then
                 echo "✅ TeleCloud đã khởi động thành công!"
             elif [ $success -eq 2 ]; then
-                echo "❌ LỖI: TeleCloud đã tự đóng (shut down). Vui lòng kiểm tra log (Mục 6)."
+                echo "❌ LỖI: TeleCloud đã tự đóng (shut down). Chi tiết nhật ký lỗi từ systemd:"
+                journalctl -u telecloud.service -n 20 --no-pager
                 return 1
             elif [ $success -eq 3 ]; then
-                echo "❌ LỖI: TeleCloud không thể duy trì trạng thái hoạt động. Vui lòng kiểm tra log (Mục 6)."
+                echo "❌ LỖI: Dịch vụ bị lỗi khởi động lặp (Crash Loop) hoặc lỗi phân quyền."
+                echo "[+] Chi tiết nhật ký lỗi từ systemd:"
+                journalctl -u telecloud.service -n 20 --no-pager
                 return 1
             else
                 echo "⚠️  CẢNH BÁO: Quá thời gian chờ (30s) nhưng chưa xác nhận được trạng thái."
@@ -813,16 +958,22 @@ stop_app() {
     if [ "$OS_TYPE" == "linux" ]; then
         if command -v systemctl &>/dev/null; then
             systemctl stop telecloud telecloud-tunnel 2>/dev/null || true
+            # Chờ dừng hẳn để tránh xung đột khi khởi động lại
+            local stop_timeout=10
+            while [ $stop_timeout -gt 0 ]; do
+                if ! is_app_running "$BASE_DIR/telecloud"; then break; fi
+                sleep 1
+                stop_timeout=$((stop_timeout - 1))
+            done
         else
             # Linux không có systemd → dùng tmux
             tmux kill-session -t $SESSION 2>/dev/null || true
-            local timeout=15
-            while [ $timeout -gt 0 ]; do
-                if ! is_app_running "$BASE_DIR/telecloud"; then
-                    break
-                fi
+            # Chờ dừng hẳn
+            local stop_timeout=15
+            while [ $stop_timeout -gt 0 ]; do
+                if ! is_app_running "$BASE_DIR/telecloud"; then break; fi
                 sleep 1
-                timeout=$((timeout - 1))
+                stop_timeout=$((stop_timeout - 1))
             done
             for pid in $(ps auxww 2>/dev/null | grep -v grep | grep "$BASE_DIR/run.sh" | awk '{print $2}'); do
                 kill "$pid" 2>/dev/null || true
@@ -1025,7 +1176,7 @@ backup_data() {
     echo "[+] Đang tạm dừng ứng dụng để đảm bảo an toàn dữ liệu..."
     stop_app
     echo "[+] Đang tạo bản sao lưu..."
-    (cd "$BASE_DIR" && tar -czf "$HOME/telecloud_backups/$BK_NAME" database.db* .env 2>/dev/null)
+    (cd "$BASE_DIR" && tar -czf "$HOME/telecloud_backups/$BK_NAME" database.db* .env master.key data/master.key 2>/dev/null)
     
     if [ $? -eq 0 ]; then
         echo "✅ Đã sao lưu thành công tại: $HOME/telecloud_backups/$BK_NAME"
@@ -1058,7 +1209,7 @@ restore_data() {
     if [ "$cf" == "y" ]; then
         stop_app
         echo "[+] Đang xóa dữ liệu cũ..."
-        rm -f "$BASE_DIR/database.db" "$BASE_DIR/database.db-wal" "$BASE_DIR/database.db-shm" 2>/dev/null || true
+        rm -f "$BASE_DIR/database.db" "$BASE_DIR/database.db-wal" "$BASE_DIR/database.db-shm" "$BASE_DIR/master.key" "$BASE_DIR/data/master.key" 2>/dev/null || true
         (cd "$BASE_DIR" && tar -xzf "$HOME/telecloud_backups/$FILE_NAME")
         echo "✅ Đã khôi phục xong. Vui lòng khởi động lại ứng dụng."
     fi
