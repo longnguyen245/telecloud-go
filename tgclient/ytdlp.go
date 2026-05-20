@@ -131,7 +131,8 @@ func GetYTDLPFormats(url string, cfg *config.Config, owner string) (*YTDLPInfo, 
 	}
 
 	var info YTDLPInfo
-	if err := json.Unmarshal([]byte(stdout.String()), &info); err != nil {
+	decoder := json.NewDecoder(strings.NewReader(stdout.String()))
+	if err := decoder.Decode(&info); err != nil {
 		return nil, fmt.Errorf("json_unmarshal_error: %w", err)
 	}
 
