@@ -38,27 +38,29 @@ var (
 	globalDownloadSemaphore chan struct{}
 
 	// Stagger mechanism to prevent bursts
-	lastUploadStart time.Time
+	nextUploadStart time.Time
 	startMu         sync.Mutex
 )
 
 func staggerUpload(ctx context.Context) {
 	startMu.Lock()
-	elapsed := time.Since(lastUploadStart)
+	now := time.Now()
+	if nextUploadStart.Before(now) {
+		nextUploadStart = now
+	}
+	wait := nextUploadStart.Sub(now)
+	nextUploadStart = nextUploadStart.Add(500 * time.Millisecond)
 	startMu.Unlock()
 
-	if elapsed < 500*time.Millisecond {
-		wait := 500*time.Millisecond - elapsed
+	if wait > 0 {
+		t := time.NewTimer(wait)
+		defer t.Stop()
 		select {
-		case <-time.After(wait):
+		case <-t.C:
 		case <-ctx.Done():
-			return // Cancelled — don't claim the stagger slot
+			return
 		}
 	}
-
-	startMu.Lock()
-	lastUploadStart = time.Now()
-	startMu.Unlock()
 }
 
 var (
@@ -168,7 +170,7 @@ type UploadStatus struct {
 	OldSize          int64 `json:"size,omitempty"`
 	OldUploadedBytes int64 `json:"uploaded_bytes,omitempty"`
 
-	startTime time.Time
+	startTime     time.Time
 	lastBroadcast time.Time
 }
 
@@ -524,6 +526,12 @@ func uploadPartsCore(
 	tracker *parallelProgressTracker,
 ) ([]partResult, error) {
 	maxParallelParts := 3
+	if botCount := GetBotCount(); botCount > 0 {
+		maxParallelParts = botCount + 1
+		if maxParallelParts > 6 {
+			maxParallelParts = 6 // Cap at 6 to prevent server resource exhaustion
+		}
+	}
 	if maxParallelParts > numParts {
 		maxParallelParts = numParts
 	}
@@ -1097,10 +1105,15 @@ func ProcessRemoteUpload(ctx context.Context, url, path, taskID string, cfg *con
 			pr := &utils.CountingReader{R: io.LimitReader(bodyReader, cfg.MaxPartSize)}
 			currentApi := GetAPI()
 
+			curPartSize := cfg.MaxPartSize
+			if size > 0 && size-totalUploaded < cfg.MaxPartSize {
+				curPartSize = size - totalUploaded
+			}
+
 			up := uploader.NewUploader(currentApi).
 				WithPartSize(uploader.MaximumPartSize).
 				WithProgress(uploadProgress{taskID: taskID, totalSize: size, previousSize: totalUploaded, owner: owner}).
-				WithThreads(adaptiveThreads(cfg.MaxPartSize, cfg))
+				WithThreads(adaptiveThreads(curPartSize, cfg))
 
 			msgID, uploadErr = uploadFilePart(ctx, currentApi, up, pr, partFilename, uniqueFilename, cfg, -1)
 
@@ -1149,13 +1162,13 @@ func ProcessRemoteUpload(ctx context.Context, url, path, taskID string, cfg *con
 	if overwrite && existingID > 0 {
 		// Identify messages to delete from Telegram BEFORE deleting the old record
 		msgIDsToDelete, _ := database.GetOrphanedMessages([]int{existingID})
-		
+
 		// Delete old record
 		database.DB.Exec("DELETE FROM files WHERE id = ?", existingID)
-		
+
 		// Rename new record to final name
 		database.DB.Exec("UPDATE files SET message_id = ?, size = ?, filename = ? WHERE id = ?", firstMsgID, totalUploaded, filename, fileID)
-		
+
 		// Clean up old messages in background
 		if len(msgIDsToDelete) > 0 {
 			go DeleteMessages(context.Background(), cfg, msgIDsToDelete)
@@ -1169,7 +1182,7 @@ func ProcessRemoteUpload(ctx context.Context, url, path, taskID string, cfg *con
 				os.Remove(*existingThumb)
 			}
 		}
-		
+
 		uniqueFilename = filename // For task update
 	} else {
 		database.DB.Exec("UPDATE files SET message_id = ?, size = ? WHERE id = ?", firstMsgID, totalUploaded, fileID)
@@ -1347,8 +1360,6 @@ func ProcessCompleteUploadSync(ctx context.Context, filePath, filename, path, mi
 
 	return fileID, uniqueFilename, nil
 }
-
-
 
 func DeleteMessages(ctx context.Context, cfg *config.Config, msgIDs []int) error {
 	if len(msgIDs) == 0 {
@@ -1674,10 +1685,15 @@ func ProcessRemoteUploadSync(ctx context.Context, url, path, taskID string, cfg 
 			pr := &utils.CountingReader{R: io.LimitReader(bodyReader, cfg.MaxPartSize)}
 			currentApi := GetAPI()
 
+			curPartSize := cfg.MaxPartSize
+			if size > 0 && size-totalUploaded < cfg.MaxPartSize {
+				curPartSize = size - totalUploaded
+			}
+
 			up := uploader.NewUploader(currentApi).
 				WithPartSize(uploader.MaximumPartSize).
 				WithProgress(uploadProgress{taskID: taskID, totalSize: size, previousSize: totalUploaded, owner: owner}).
-				WithThreads(adaptiveThreads(cfg.MaxPartSize, cfg))
+				WithThreads(adaptiveThreads(curPartSize, cfg))
 
 			msgID, uploadErr = uploadFilePart(ctx, currentApi, up, pr, partFilename, uniqueFilename, cfg, -1)
 
@@ -1724,13 +1740,13 @@ func ProcessRemoteUploadSync(ctx context.Context, url, path, taskID string, cfg 
 	if overwrite && existingID > 0 {
 		// Identify messages to delete from Telegram BEFORE deleting the old record
 		msgIDsToDelete, _ := database.GetOrphanedMessages([]int{existingID})
-		
+
 		// Delete old record
 		database.DB.Exec("DELETE FROM files WHERE id = ?", existingID)
-		
+
 		// Rename new record to final name
 		database.DB.Exec("UPDATE files SET message_id = ?, size = ?, filename = ? WHERE id = ?", firstMsgID, totalUploaded, filename, fileID)
-		
+
 		// Clean up old messages in background
 		if len(msgIDsToDelete) > 0 {
 			go DeleteMessages(context.Background(), cfg, msgIDsToDelete)

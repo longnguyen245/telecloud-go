@@ -4,7 +4,9 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"log"
 	"mime"
+	"net/http"
 	"os"
 	"path"
 	"path/filepath"
@@ -191,6 +193,7 @@ func (b *TelecloudBackend) GetObject(bucketName, objectName string, rangeRequest
 
 	rs, err := tgclient.GetTelegramFileReader(context.Background(), file, b.cfg)
 	if err != nil {
+		log.Printf("[S3] GetObject reader failed user=%s key=%q file_id=%d: %v", b.username, objectName, file.ID, err)
 		return nil, err
 	}
 
@@ -203,9 +206,10 @@ func (b *TelecloudBackend) GetObject(bucketName, objectName string, rangeRequest
 
 	var body io.ReadCloser
 	size := file.Size
+	var contentRange *gofakes3.ObjectRange
 
 	if rangeRequest != nil {
-		contentRange, err := rangeRequest.Range(size)
+		contentRange, err = rangeRequest.Range(size)
 		if err != nil {
 			rs.Close()
 			return nil, err
@@ -216,15 +220,17 @@ func (b *TelecloudBackend) GetObject(bucketName, objectName string, rangeRequest
 			return nil, err
 		}
 		body = &closerReader{r: io.LimitReader(rs, contentRange.Length), c: rs}
-		size = contentRange.Length
 	} else {
 		body = rs
 	}
 
+	// Keep Size as the full object size. gofakes3 writes ranged Content-Length
+	// from Object.Range.Length and uses Size as the total in Content-Range.
 	return &gofakes3.Object{
 		Name:     objectName,
 		Metadata: metadata,
 		Size:     size,
+		Range:    contentRange,
 		Contents: body,
 	}, nil
 }
@@ -256,7 +262,7 @@ func (b *TelecloudBackend) HeadObject(bucketName, objectName string) (*gofakes3.
 		Name:     objectName,
 		Metadata: metadata,
 		Size:     file.Size,
-		Contents: nil, // Optimization: HeadObject doesn't need to read content
+		Contents: http.NoBody,
 	}, nil
 }
 
@@ -359,11 +365,19 @@ func (b *TelecloudBackend) PutObject(bucketName, key string, meta map[string]str
 		mimeType = "application/octet-stream"
 	}
 
-	_, _, err = tgclient.ProcessCompleteUploadSync(context.Background(), tempFilePath, filename, dbPath, mimeType, taskID, b.cfg, true, b.username)
+	fileSize := int64(0)
+	if fileInfo, err := os.Stat(tempFilePath); err == nil {
+		fileSize = fileInfo.Size()
+	}
+	tgclient.UpdateTaskWithFile(taskID, "processing", 0, "uploading_to_telegram", filename, b.username, fileSize, 0)
+
+	fileID, finalName, err := tgclient.ProcessCompleteUploadSync(context.Background(), tempFilePath, filename, dbPath, mimeType, taskID, b.cfg, true, b.username)
 	if err != nil {
+		tgclient.UpdateTask(taskID, "error", 0, "upload_failed: "+err.Error(), b.username)
 		return gofakes3.PutObjectResult{}, err
 	}
 
+	tgclient.UpdateTaskWithFileID(taskID, "done", 100, "", fileID, finalName, b.username)
 	return gofakes3.PutObjectResult{}, nil
 }
 

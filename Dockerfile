@@ -7,12 +7,10 @@ ARG TARGETARCH
 ARG BUILDPLATFORM
 WORKDIR /app
 
-# Install curl and Node.js 20+ for frontend (tailwindcss oxide requires node >= 20)
-RUN apt-get update && apt-get install -y ca-certificates curl gnupg && \
-    mkdir -p /etc/apt/keyrings && \
-    curl -fsSL https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key | gpg --dearmor -o /etc/apt/keyrings/nodesource.gpg && \
-    echo "deb [signed-by=/etc/apt/keyrings/nodesource.gpg] https://deb.nodesource.com/node_20.x nodistro main" > /etc/apt/sources.list.d/nodesource.list && \
-    apt-get update && apt-get install -y nodejs && \
+# Install curl, unzip, Node.js, npm, and Bun for frontend
+RUN apt-get update && apt-get install -y ca-certificates curl unzip nodejs npm && \
+    curl -fsSL https://bun.sh/install | bash && \
+    mv /root/.bun/bin/bun /usr/local/bin/bun && \
     rm -rf /var/lib/apt/lists/*
 
 # Download dependencies first (cache layer)
@@ -26,13 +24,15 @@ COPY . .
 RUN if [ -d .git ]; then git submodule update --init --recursive; else echo "Not a git repository, skipping submodule init"; fi
 
 # Build frontend (Tailwind + bundle assets via npm)
-RUN cd web && sed -i 's/\r$//' build-frontend.sh && bash build-frontend.sh 1
+RUN cd web && sed -i 's/\r$//' build-frontend.sh && bash build-frontend.sh
 
 # Build Go binary for TARGET architecture
 ARG VERSION=dev
+ARG DEFAULT_API_ID="0"
+ARG DEFAULT_API_HASH=""
 RUN CGO_ENABLED=0 GOOS=linux GOARCH=$TARGETARCH go build \
     -p 2 \
-    -ldflags="-s -w -X main.version=${VERSION}" \
+    -ldflags="-s -w -X main.version=${VERSION} -X telecloud/config.DefaultAPIIDStr=${DEFAULT_API_ID} -X telecloud/config.DefaultAPIHash=${DEFAULT_API_HASH}" \
     -o telecloud .
 
 # Create data directory and set permissions for the nonroot user (UID 65532)

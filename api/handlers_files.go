@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"log"
@@ -100,6 +101,10 @@ func (h *Handler) handleGetIndex(c *gin.Context) {
 	currentRPID, currentOrigins := GetWebAuthnConfig()
 	originsStr := strings.Join(currentOrigins, ",")
 
+	botStatuses := tgclient.GetBotStatuses(h.cfg)
+	botStatusesJSON, _ := json.Marshal(botStatuses)
+	botStatusesStr := string(botStatusesJSON)
+
 	c.HTML(http.StatusOK, "index.html", gin.H{
 		"webdav_enabled":        webdavEnabled,
 		"global_webdav_enabled": globalWebdavEnabled,
@@ -119,6 +124,9 @@ func (h *Handler) handleGetIndex(c *gin.Context) {
 		"storage_used":          userStorageUsed,
 		"theme":                 database.GetUserSetting(sessionUsername, "theme"),
 		"force_change":          forcePasswordChange,
+		"log_group_id":          database.GetSetting("log_group_id"),
+		"bot_tokens":            database.GetSetting("bot_tokens"),
+		"bot_statuses":          botStatusesStr,
 	})
 }
 
@@ -228,6 +236,9 @@ func (h *Handler) handleGetFiles(c *gin.Context) {
 					}
 				}(i)
 			}
+		}
+		if files[i].SharePassword != nil && *files[i].SharePassword != "" {
+			files[i].HasSharePassword = true
 		}
 	}
 	var storageUsed int64
@@ -1296,7 +1307,7 @@ func (h *Handler) handlePostCheckExists(c *gin.Context) {
 	path := c.PostForm("path")
 	filenamesStr := c.PostForm("filenames")
 	if filenamesStr == "" {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "filenames_required"})
+		c.JSON(http.StatusOK, gin.H{"existing": []string{}})
 		return
 	}
 	filenames := strings.Split(filenamesStr, "|")

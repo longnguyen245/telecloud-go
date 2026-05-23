@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"io/fs"
+	"log"
 	"os"
 	"os/exec"
 	pathpkg "path"
@@ -199,6 +200,9 @@ func ProcessTorrentUpload(ctx context.Context, input, path, taskID string, cfg *
 				}
 			}
 		}
+		if err := scanner.Err(); err != nil {
+			log.Printf("[Torrent stderr scanner] error: %v", err)
+		}
 	}()
 
 	scanner := bufio.NewScanner(stdout)
@@ -247,7 +251,7 @@ func ProcessTorrentUpload(ctx context.Context, input, path, taskID string, cfg *
 			gid := m[1]
 			downloadedStr := m[2]
 			totalStr := m[3]
-			
+
 			p := 0
 			if len(m) > 4 && m[4] != "" {
 				p, _ = strconv.Atoi(m[4])
@@ -274,7 +278,7 @@ func ProcessTorrentUpload(ctx context.Context, input, path, taskID string, cfg *
 					// We transitioned, reset progress reporting for the new file
 					lastPercent = -1
 					// CRITICAL: Reset lastTotalSize because GID #2 is a different download task
-					lastTotalSize = 0 
+					lastTotalSize = 0
 				}
 				lastGID = gid
 			}
@@ -312,6 +316,9 @@ func ProcessTorrentUpload(ctx context.Context, input, path, taskID string, cfg *
 				lastPercent = p
 			}
 		}
+	}
+	if err := scanner.Err(); err != nil {
+		log.Printf("[Torrent stdout scanner] error: %v", err)
 	}
 
 	if err := cmd.Wait(); err != nil {
