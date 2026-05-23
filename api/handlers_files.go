@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"telecloud/config"
 	"telecloud/database"
 	"telecloud/tgclient"
 	"telecloud/utils"
@@ -1161,6 +1162,69 @@ func (h *Handler) handleGetThumb(c *gin.Context) {
 	}
 
 	c.File(*item.ThumbPath)
+}
+
+func (h *Handler) handleBackupLocalThumb(c *gin.Context) { 
+	cfg, err := config.Load()
+	entries, err := os.ReadDir(cfg.ThumbsDir)
+	if err != nil {
+		return
+	}
+
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+
+		thumbPath := filepath.Join(cfg.ThumbsDir, entry.Name())
+
+		log.Print("sync thumb:", thumbPath)
+
+		var file struct {
+			ID int `db:"id"`
+		}
+
+		err := database.RODB.Get(
+			&file,
+			"SELECT id FROM files WHERE thumb_path = ?",
+			thumbPath,
+		)
+
+		if err != nil {
+			continue
+		}
+
+		var exists int
+
+		err = database.RODB.Get(
+			&exists,
+			"SELECT COUNT(*) FROM thumb_backups WHERE file_id = ?",
+			file.ID,
+		)
+
+		if err != nil || exists > 0 {
+			continue
+		}
+
+		// upload
+		url := tgclient.UploadImage(&thumbPath)
+		if url == "" {
+			continue
+		}
+
+		_, err = database.DB.Exec(
+			"INSERT INTO thumb_backups (file_id, url, type) VALUES (?, ?, ?)",
+			file.ID,
+			url,
+			"cloudinary",
+		)
+
+		if err != nil {
+			log.Print(err)
+		} else {
+			log.Print("Backup " + thumbPath)
+		}
+	}
 }
 
 func (h *Handler) handleStreamFile(c *gin.Context) {
