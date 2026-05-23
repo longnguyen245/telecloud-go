@@ -24,6 +24,7 @@ type Config struct {
 	LogGroupID       string
 	Port             string
 	TempDir          string
+	ThumbBackupType  string // Not in use now, but will provide a possibility for scaling
 	ProxyURL         string
 	Version          string
 	FFMPEGPath       string
@@ -111,6 +112,7 @@ func Load() (*Config, error) {
 		Port:             getEnv("PORT", "8091"),
 		TempDir:          getEnv("TEMP_DIR", filepath.Join(os.TempDir(), "telecloud_temp_chunks")),
 		ProxyURL:         getEnv("PROXY_URL", ""),
+		ThumbBackupType:  getEnv("THUMB_BACKUP_TYPE", ""),
 		FFMPEGPath:       ffmpegPath,
 		YTDLPPath:        ytdlpPath,
 		WebAuthnRPID:     getEnv("WEBAUTHN_RPID", "localhost"),

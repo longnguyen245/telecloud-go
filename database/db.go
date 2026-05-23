@@ -241,6 +241,16 @@ const sqliteSchema = `
 		share_password TEXT
 	);
 
+	CREATE TABLE IF NOT EXISTS thumb_backups (
+		file_id INTEGER PRIMARY KEY,
+		url TEXT NOT NULL,
+		created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+		type TEXT NOT NULL,
+		FOREIGN KEY (file_id)
+		REFERENCES files(id)
+		ON DELETE CASCADE
+	);
+
 	CREATE TABLE IF NOT EXISTS settings (
 		key TEXT PRIMARY KEY,
 		value TEXT NOT NULL
@@ -360,6 +370,17 @@ const mysqlSchema = `
 		share_password TEXT
 	) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
+	CREATE TABLE IF NOT EXISTS thumb_backups (
+		file_id BIGINT PRIMARY KEY,
+		url TEXT NOT NULL,
+		created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+		type TEXT NOT NULL,
+		CONSTRAINT fk_thumb_backup_file
+		FOREIGN KEY (file_id)
+		REFERENCES files(id)
+		ON DELETE CASCADE
+	) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
 	CREATE TABLE IF NOT EXISTS settings (
 		` + "`key`" + ` VARCHAR(191) PRIMARY KEY,
 		value TEXT NOT NULL
@@ -476,6 +497,17 @@ const postgresSchema = `
 		created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
 		deleted_at TIMESTAMP,
 		share_password TEXT
+	);
+
+	CREATE TABLE IF NOT EXISTS thumb_backups (
+		file_id BIGINT PRIMARY KEY,
+		url TEXT NOT NULL,
+		created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+		type TEXT NOT NULL,
+		CONSTRAINT fk_thumb_backup_file
+		FOREIGN KEY (file_id)
+		REFERENCES files(id)
+		ON DELETE CASCADE
 	);
 
 	CREATE TABLE IF NOT EXISTS settings (
@@ -610,6 +642,7 @@ func migrateSQLite() error {
 	DB.Exec("ALTER TABLE upload_tasks ADD COLUMN overwrite BOOLEAN DEFAULT 0")
 	DB.Exec("ALTER TABLE files ADD COLUMN deleted_at DATETIME")
 	DB.Exec("ALTER TABLE files ADD COLUMN share_password TEXT")
+	DB.Exec("CREATE TABLE IF NOT EXISTS thumb_backups (file_id INTEGER PRIMARY KEY, url TEXT NOT NULL,, created_at DATETIME DEFAULT CURRENT_TIMESTAMP, type TEXT NOT NULL, FOREIGN KEY (file_id) REFERENCES files(id) ON DELETE CASCADE)")
 	// Sessions get an explicit expiry column so we can stop trusting tokens
 	// older than 30 days, even if the cookie was somehow retained.
 	DB.Exec("ALTER TABLE sessions ADD COLUMN expires_at DATETIME")
@@ -729,6 +762,9 @@ func migrateMySQL() error {
 	if err := alterTableMySQL("files", "ADD COLUMN share_password TEXT"); err != nil {
 		return err
 	}
+	if _, err := DB.Exec("CREATE TABLE IF NOT EXISTS thumb_backups (file_id BIGINT PRIMARY KEY, url TEXT NOT NULL,, created_at DATETIME DEFAULT CURRENT_TIMESTAMP, type TEXT NOT NULL, CONSTRAINT fk_thumb_backup_file FOREIGN KEY (file_id) REFERENCES files(id) ON DELETE CASCADE) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci"); err != nil {
+		return err
+	}
 	if err := alterTableMySQL("sessions", "ADD COLUMN expires_at DATETIME"); err != nil {
 		return err
 	}
@@ -752,6 +788,7 @@ func migratePostgres() error {
 	DB.Exec("CREATE INDEX IF NOT EXISTS idx_files_path ON files(path)")
 	DB.Exec("CREATE INDEX IF NOT EXISTS idx_files_filename ON files(filename)")
 	DB.Exec("CREATE INDEX IF NOT EXISTS idx_files_owner_path ON files(owner, path, filename)")
+	DB.Exec("CREATE TABLE IF NOT EXISTS thumb_backups (file_id BIGINT PRIMARY KEY, url TEXT NOT NULL,, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, type TEXT NOT NULL, CONSTRAINT fk_thumb_backup_file FOREIGN KEY (file_id) REFERENCES files(id) ON DELETE CASCADE)")
 	DB.Exec("ALTER TABLE sessions ADD COLUMN IF NOT EXISTS expires_at TIMESTAMP")
 	DB.Exec("CREATE INDEX IF NOT EXISTS idx_sessions_expires ON sessions(expires_at)")
 	DB.Exec("UPDATE sessions SET expires_at = created_at + INTERVAL '30 days' WHERE expires_at IS NULL")
