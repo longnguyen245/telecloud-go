@@ -794,6 +794,11 @@ func ProcessCompleteUpload(ctx context.Context, filePath, filename, path, mimeTy
 
 	localThumb := utils.CreateLocalThumbnail(filePath, mimeType, cfg.FFMPEGPath)
 	if localThumb != nil {
+		url := UploadImage(localThumb)
+		if url != "" {
+			database.DB.Exec("INSERT INTO thumb_backups (file_id, url, type) VALUES (?, ?, ?)",
+				fileID, url, "cloudinary")
+		}
 		database.DB.Exec("UPDATE files SET thumb_path = ? WHERE id = ?", *localThumb, fileID)
 	}
 
@@ -1332,6 +1337,11 @@ func ProcessCompleteUploadSync(ctx context.Context, filePath, filename, path, mi
 
 	localThumb := utils.CreateLocalThumbnail(filePath, mimeType, cfg.FFMPEGPath)
 	if localThumb != nil {
+		url := UploadImage(localThumb)
+		if url != "" {
+			database.DB.Exec("INSERT INTO thumb_backups (file_id, url, type) VALUES (?, ?, ?)",
+				fileID, url, "cloudinary")
+		}
 		database.DB.Exec("UPDATE files SET thumb_path = ? WHERE id = ?", *localThumb, fileID)
 	}
 

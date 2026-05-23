@@ -184,6 +184,48 @@ func (h *Handler) handleGetFiles(c *gin.Context) {
 		if files[i].ThumbPath != nil {
 			if _, err := os.Stat(*files[i].ThumbPath); err == nil {
 				files[i].HasThumb = true
+			} else {
+				go func(i int) {
+					var backup struct {
+						URL  string `db:"url"`
+					}
+
+					err = database.RODB.Get(
+						&backup,
+						"SELECT url FROM thumb_backups WHERE file_id = ?",
+						*&files[i].ID,
+					)
+
+					if err != nil {
+						return
+					}
+
+					// Download backup thumbnail
+					resp, err := http.Get(backup.URL)
+					if err != nil || resp.StatusCode != http.StatusOK {
+						fmt.Errorf("Download backup thumbnail fail")
+						return
+					}
+					defer resp.Body.Close()
+
+					// recreate thumbnail local
+					file, err := os.Create(*files[i].ThumbPath)
+					if err != nil {
+						fmt.Errorf("Recreate thumbnail local fail")
+						return
+					}
+					defer file.Close()
+
+					_, err = io.Copy(file, resp.Body)
+					if err != nil {
+						fmt.Errorf("Copy thumbnail local fail")
+						return
+					}
+
+					if _, err := os.Stat(*files[i].ThumbPath); err == nil {
+						files[i].HasThumb = true
+					}
+				}(i)
 			}
 		}
 	}
@@ -1074,6 +1116,50 @@ func (h *Handler) handleGetThumb(c *gin.Context) {
 		c.AbortWithStatus(http.StatusNotFound)
 		return
 	}
+
+	// Thumbnail exist
+	if _, err := os.Stat(*item.ThumbPath); err == nil {
+		c.File(*item.ThumbPath)
+		return
+	}
+
+	var backup struct {
+		URL  string `db:"url"`
+	}
+
+	err = database.RODB.Get(
+		&backup,
+		"SELECT url FROM thumb_backups WHERE file_id = ?",
+		id,
+	)
+
+	if err != nil {
+		c.AbortWithStatus(http.StatusNotFound)
+		return
+	}
+
+	// Download backup thumbnail
+	resp, err := http.Get(backup.URL)
+	if err != nil || resp.StatusCode != http.StatusOK {
+		c.AbortWithStatus(http.StatusNotFound)
+		return
+	}
+	defer resp.Body.Close()
+
+	// recreate thumbnail local
+	file, err := os.Create(*item.ThumbPath)
+	if err != nil {
+		c.AbortWithStatus(http.StatusInternalServerError)
+		return
+	}
+	defer file.Close()
+
+	_, err = io.Copy(file, resp.Body)
+	if err != nil {
+		c.AbortWithStatus(http.StatusInternalServerError)
+		return
+	}
+
 	c.File(*item.ThumbPath)
 }
 
