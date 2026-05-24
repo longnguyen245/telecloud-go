@@ -425,7 +425,7 @@ create_env() {
 
         cat > "$BASE_DIR/.env" <<EOF
 PORT=$PORT
-LISTEN_ADDR=127.0.0.1
+LISTEN_ADDR=0.0.0.0
 
 # Master key to encrypt sessions and sensitive settings (Auto-generated if left blank)
 TELECLOUD_MASTER_KEY=$MASTER_KEY

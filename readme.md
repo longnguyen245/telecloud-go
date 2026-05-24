@@ -73,6 +73,20 @@ Tải [**`auto-install.bat`**](https://raw.githubusercontent.com/dabeecao/telecl
 
 ---
 
+## 🚀 Quick Start (English)
+
+Use the automated script — the easiest way to get started:
+
+### Linux / Termux / macOS / Raspberry Pi
+```bash
+curl -fsSL https://raw.githubusercontent.com/dabeecao/telecloud-go/main/auto-setup-en.sh -o auto-setup-en.sh && bash auto-setup-en.sh
+```
+
+### Windows
+Download [**`auto-install-en.bat`**](https://raw.githubusercontent.com/dabeecao/telecloud-go/main/auto-install-en.bat) and run as **Administrator**.
+
+---
+
 ## 📖 Tài liệu chi tiết (Wiki)
 
 Để biết thêm chi tiết về cấu hình và các phương pháp cài đặt khác, vui lòng xem tài liệu:
@@ -106,15 +120,16 @@ Dự án được cung cấp **"nguyên trạng" (as-is)**, không có bất k�
 ## 🙏 Đóng góp
 
 Dự án sử dụng các thư viện tuyệt vời: 
-* [gotd/td](https://github.com/gotd/td): Telegram client, in Go. (MTProto API)
-* [Gin](https://github.com/gin-gonic/gin): High-performance HTTP web framework.
-* [AlpineJS](https://github.com/alpinejs/alpine): A rugged, minimal framework for JS.
-* [TailwindCSS](https://github.com/tailwindlabs/tailwindcss): A utility-first CSS framework.
-* [plyr](https://github.com/sampotts/plyr): A simple HTML5 media player.
+* [gotd/td](https://github.com/gotd/td): Telegram client (MTProto API)
+* [Gin](https://github.com/gin-gonic/gin): High-performance HTTP web framework
+* [AlpineJS](https://github.com/alpinejs/alpine): Minimal JS framework
+* [TailwindCSS](https://github.com/tailwindlabs/tailwindcss): Utility-first CSS framework
+* [plyr](https://github.com/sampotts/plyr): HTML5 media player
 * [Artplayer.js](https://github.com/zhw2590582/ArtPlayer): Modern and full-featured HTML5 video player.
 * [PDF.js](https://github.com/mozilla/pdf.js): HTML5 PDF reader and viewer.
 * [Prism.js](https://github.com/PrismJS/prism): Lightweight, extensible syntax highlighter.
 * [FontAwesome](https://fontawesome.com): The world's most popular icon set.
+* [Bun](https://bun.com): Fast JavaScript runtime & toolkit (build toolchain).
 * [yt-dlp](https://github.com/yt-dlp/yt-dlp): Audio/video downloader.
 * [aria2](https://github.com/aria2/aria2): Multi-protocol download utility.
 * [Google Fonts (Nunito)](https://fonts.google.com/specimen/Nunito): Modern sans-serif typeface.
