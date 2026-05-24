@@ -1,0 +1,95 @@
+name: Auto Sync Fork Release
+
+on:
+  schedule:
+    - cron: '0 */6 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  sync-release:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout fork
+        uses: actions/checkout@v6
+        with:
+          ref: build-release
+          fetch-depth: 0
+          token: ${{ secrets.GH_PAT }}
+
+      - name: Setup git
+        run: |
+          git config user.name "github-actions"
+          git config user.email "github-actions@github.com"
+
+      - name: Add source repository
+        run: |
+          git remote add source https://github.com/dabeecao/telecloud-go.git
+          git fetch source --tags
+          git fetch source
+
+      - name: Get latest source tag
+        id: source
+        run: |
+          TAG=$(git ls-remote --tags source | \
+            grep -v '\^{}' | \
+            sed 's|.*refs/tags/||' | \
+            sort -V | \
+            tail -n1)
+
+          echo "tag=$TAG" >> $GITHUB_OUTPUT
+          echo "fork_tag=${TAG}-fork" >> $GITHUB_OUTPUT
+
+      - name: Check release exists
+        id: check
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT }}
+        run: |
+          if gh release view "${{ steps.source.outputs.fork_tag }}" >/dev/null 2>&1; then
+            echo "exists=true" >> $GITHUB_OUTPUT
+          else
+            echo "exists=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Merge latest tag
+        if: steps.check.outputs.exists == 'false'
+        run: |
+          TAG=${{ steps.source.outputs.tag }}
+
+          git checkout build-release
+
+          git merge "refs/tags/$TAG" \
+            --allow-unrelated-histories \
+            --no-edit
+
+      - name: Push branch
+        if: steps.check.outputs.exists == 'false'
+        run: |
+          git push origin build-release
+
+      - name: Create fork tag
+        if: steps.check.outputs.exists == 'false'
+        run: |
+          FORK_TAG=${{ steps.source.outputs.fork_tag }}
+
+          git tag "$FORK_TAG"
+          git push origin "$FORK_TAG"
+
+      - name: Create GitHub Release
+        if: steps.check.outputs.exists == 'false'
+        uses: softprops/action-gh-release@v2
+        with:
+          token: ${{ secrets.GH_PAT }} 
+          tag_name: ${{ steps.source.outputs.fork_tag }}
+          target_commitish: build-release
+          name: ${{ steps.source.outputs.fork_tag }}
+          body: |
+            Auto synced release from:
+
+            https://github.com/dabeecao/telecloud-go
+
+            Original tag:
+            ${{ steps.source.outputs.tag }}
