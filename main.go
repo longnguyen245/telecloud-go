@@ -88,7 +88,7 @@ func executeRestart() {
 }
 
 var (
-	version = "v3.7.0"
+	version = "v3.7.1"
 	commit  = "none"
 	date    = "unknown"
 )
@@ -233,14 +233,7 @@ func main() {
 
 	listenAddr := cfg.ListenAddr
 	if listenAddr == "" {
-		// Pre-setup we bind to loopback only so the open /setup endpoint can't
-		// be reached by random scanners on the public IP.
-		if adminUser == "" {
-			listenAddr = "127.0.0.1"
-			log.Println("Setup not finished — binding to 127.0.0.1 only. Set LISTEN_ADDR=0.0.0.0 to override.")
-		} else {
-			listenAddr = "0.0.0.0"
-		}
+		listenAddr = "0.0.0.0"
 	}
 
 	httpServer := &http.Server{

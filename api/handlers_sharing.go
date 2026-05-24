@@ -370,6 +370,13 @@ func (h *Handler) handleGetDirectDownload(c *gin.Context) {
 		return
 	}
 
+	// Direct links cannot present a password prompt, so block access entirely
+	// if the share is password-protected.
+	if item.SharePassword != nil && *item.SharePassword != "" {
+		c.JSON(http.StatusForbidden, gin.H{"error": "password_required"})
+		return
+	}
+
 	c.Header("Content-Disposition", fmt.Sprintf(`attachment; filename="%s"`, item.Filename))
 	if item.MimeType != nil {
 		c.Header("Content-Type", *item.MimeType)
