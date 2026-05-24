@@ -86,6 +86,8 @@ jobs:
           tag_name: ${{ steps.source.outputs.fork_tag }}
           target_commitish: build-release
           name: ${{ steps.source.outputs.fork_tag }}
+          prerelease: false
+          make_latest: true
           body: |
             Auto synced release from:
 
