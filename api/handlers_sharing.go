@@ -87,7 +87,7 @@ func (h *Handler) handleVerifySharePassword(c *gin.Context) {
 func (h *Handler) handleGetSharedFile(c *gin.Context) {
 	token := c.Param("token")
 	var item database.File
-	if err := database.RODB.Get(&item, "SELECT id, filename, size, created_at, thumb_path, is_folder, path, share_password FROM files WHERE share_token = ? AND deleted_at IS NULL AND (is_folder = 1 OR message_id IS NOT NULL)", token); err != nil {
+	if err := database.RODB.Get(&item, "SELECT id, filename, size, created_at, thumb_path, is_folder, path, share_password, share_views, share_downloads FROM files WHERE share_token = ? AND deleted_at IS NULL AND (is_folder = 1 OR message_id IS NOT NULL)", token); err != nil {
 		c.HTML(http.StatusNotFound, "error.html", gin.H{
 			"error_message": "File not found or link has been revoked.",
 			"version":       h.cfg.Version,
@@ -104,12 +104,18 @@ func (h *Handler) handleGetSharedFile(c *gin.Context) {
 		return
 	}
 
+	// Increment views count
+	database.DB.Exec("UPDATE files SET share_views = share_views + 1 WHERE id = ?", item.ID)
+	item.ShareViews++ // Update in-memory struct for template rendering
+
 	if item.IsFolder {
 		c.HTML(http.StatusOK, "share_folder.html", gin.H{
-			"filename":   item.Filename,
-			"created_at": item.CreatedAt.Format("2006-01-02 15:04:05"),
-			"token":      token,
-			"version":    h.cfg.Version,
+			"filename":        item.Filename,
+			"created_at":      item.CreatedAt.Format("2006-01-02 15:04:05"),
+			"token":           token,
+			"version":         h.cfg.Version,
+			"share_views":     item.ShareViews,
+			"share_downloads": item.ShareDownloads,
 		})
 		return
 	}
@@ -122,14 +128,16 @@ func (h *Handler) handleGetSharedFile(c *gin.Context) {
 	}
 
 	c.HTML(http.StatusOK, "share.html", gin.H{
-		"id":             item.ID,
-		"filename":       item.Filename,
-		"size":           item.Size,
-		"formatted_size": formatBytes(item.Size),
-		"created_at":     item.CreatedAt.Format("2006-01-02 15:04:05"),
-		"token":          token,
-		"has_thumb":      hasThumb,
-		"version":        h.cfg.Version,
+		"id":              item.ID,
+		"filename":        item.Filename,
+		"size":            item.Size,
+		"formatted_size":  formatBytes(item.Size),
+		"created_at":      item.CreatedAt.Format("2006-01-02 15:04:05"),
+		"token":           token,
+		"has_thumb":       hasThumb,
+		"version":         h.cfg.Version,
+		"share_views":     item.ShareViews,
+		"share_downloads": item.ShareDownloads,
 	})
 }
 
@@ -222,6 +230,12 @@ func (h *Handler) handleDownloadSharedFile(c *gin.Context) {
 	if !h.checkShareAuth(c, item) {
 		c.AbortWithStatus(http.StatusForbidden)
 		return
+	}
+
+	// Only increment download count for initial download request (no Range or Range starting at 0)
+	rangeHeader := strings.ToLower(strings.TrimSpace(c.Request.Header.Get("Range")))
+	if rangeHeader == "" || strings.HasPrefix(rangeHeader, "bytes=0-") {
+		database.DB.Exec("UPDATE files SET share_downloads = share_downloads + 1 WHERE id = ?", item.ID)
 	}
 
 	c.Header("Content-Disposition", fmt.Sprintf(`attachment; filename="%s"`, item.Filename))
@@ -330,6 +344,12 @@ func (h *Handler) handleDownloadSharedFileInFolder(c *gin.Context) {
 		return
 	}
 
+	// Only increment download count for initial download request (no Range or Range starting at 0)
+	rangeHeader := strings.ToLower(strings.TrimSpace(c.Request.Header.Get("Range")))
+	if rangeHeader == "" || strings.HasPrefix(rangeHeader, "bytes=0-") {
+		database.DB.Exec("UPDATE files SET share_downloads = share_downloads + 1 WHERE share_token = ? AND deleted_at IS NULL", token)
+	}
+
 	c.Header("Content-Disposition", fmt.Sprintf(`attachment; filename="%s"`, item.Filename))
 	if item.MimeType != nil {
 		c.Header("Content-Type", *item.MimeType)
@@ -377,6 +397,12 @@ func (h *Handler) handleGetDirectDownload(c *gin.Context) {
 		return
 	}
 
+	// Only increment download count for initial download request (no Range or Range starting at 0)
+	rangeHeader := strings.ToLower(strings.TrimSpace(c.Request.Header.Get("Range")))
+	if rangeHeader == "" || strings.HasPrefix(rangeHeader, "bytes=0-") {
+		database.DB.Exec("UPDATE files SET share_downloads = share_downloads + 1 WHERE id = ?", item.ID)
+	}
+
 	c.Header("Content-Disposition", fmt.Sprintf(`attachment; filename="%s"`, item.Filename))
 	if item.MimeType != nil {
 		c.Header("Content-Type", *item.MimeType)
@@ -409,7 +435,7 @@ func (h *Handler) handleShareFile(c *gin.Context) {
 	}
 
 	token := uuid.New().String()
-	database.DB.Exec("UPDATE files SET share_token = ?, share_password = ? WHERE id = ?", token, hashedPass, id)
+	database.DB.Exec("UPDATE files SET share_token = ?, share_password = ?, share_views = 0, share_downloads = 0 WHERE id = ?", token, hashedPass, id)
 
 	resp := gin.H{"share_token": token}
 	if !item.IsFolder {
@@ -426,10 +452,46 @@ func (h *Handler) handleRevokeShare(c *gin.Context) {
 	}
 	var item database.File
 	username := c.GetString("username")
-	if err := database.RODB.Get(&item, "SELECT path FROM files WHERE id = ? AND owner = ?", id, username); err != nil {
+	if err := database.RODB.Get(&item, "SELECT path, share_token FROM files WHERE id = ? AND owner = ?", id, username); err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "not found"})
 		return
 	}
-	database.DB.Exec("UPDATE files SET share_token = NULL, share_password = NULL WHERE id = ?", id)
+	if item.ShareToken != nil {
+		database.DB.Exec("DELETE FROM share_sessions WHERE share_token = ?", *item.ShareToken)
+	}
+	database.DB.Exec("UPDATE files SET share_token = NULL, share_password = NULL, share_views = 0, share_downloads = 0 WHERE id = ?", id)
 	c.JSON(http.StatusOK, gin.H{"status": "revoked"})
 }
+
+func (h *Handler) handleGetShares(c *gin.Context) {
+	username := c.GetString("username")
+	isAdmin := c.GetBool("is_admin")
+
+	var files []database.File
+	query := "SELECT * FROM files WHERE owner = ? AND share_token IS NOT NULL AND deleted_at IS NULL ORDER BY is_folder DESC, id DESC"
+	err := database.RODB.Select(&files, query, username)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	for i := range files {
+		files[i].Path = unmapPath(files[i].Path, username, isAdmin)
+		if files[i].ShareToken != nil && !files[i].IsFolder {
+			files[i].DirectToken = utils.GenerateDirectToken(*files[i].ShareToken)
+		}
+		if files[i].ThumbPath != nil {
+			if _, err := os.Stat(*files[i].ThumbPath); err == nil {
+				files[i].HasThumb = true
+			}
+		}
+		if files[i].SharePassword != nil && *files[i].SharePassword != "" {
+			files[i].HasSharePassword = true
+		}
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"files": files,
+	})
+}
+

@@ -49,7 +49,7 @@
 * ⚡ **Tải trong nền**: Hỗ trợ tải tệp từ URL trong nền, không cần treo trình duyệt, có thông báo tiến trình real-time.
 * 🧲 **Tải Torrent**: Hỗ trợ tải Torrent và Magnet link trực tiếp về Telegram thông qua **aria2c**.
 * 👥 **Đa người dùng**: Hỗ trợ tạo tài khoản con với không gian lưu trữ riêng biệt (Virtual Path).
-* 🤖 **Multi-Bot (Bot Pool)**: Sử dụng nhiều Bot phụ để chia đều tải trọng, tăng tối đa tốc độ và độ ổn định.
+* 🤖 **Multi-Bot (Bot Pool) & Nhận tệp cá nhân**: Sử dụng nhiều Bot phụ để chia đều tải trọng, tăng tốc độ. Đồng thời hỗ trợ từng thành viên (kể cả tài khoản con) liên kết tài khoản Telegram cá nhân để nhận tệp trực tiếp từ bất kỳ bot nào trong Bot Pool tự động lưu về thư mục riêng.
 * 🔐 **Bảo mật Passkey**: Hỗ trợ đăng nhập bằng vân tay, khuôn mặt hoặc khóa bảo mật (WebAuthn).
 * 🗄️ **Đa cơ sở dữ liệu**: Hỗ trợ **SQLite**, **MySQL** và **PostgreSQL** cho các hệ thống lớn.
 * 🗑️ **Thùng rác**: Lưu trữ và khôi phục các tệp đã xóa, bảo vệ dữ liệu khỏi việc xóa nhầm.

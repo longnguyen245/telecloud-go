@@ -127,6 +127,15 @@ func (h *Handler) handleGetIndex(c *gin.Context) {
 		"log_group_id":          database.GetSetting("log_group_id"),
 		"bot_tokens":            database.GetSetting("bot_tokens"),
 		"bot_statuses":          botStatusesStr,
+		"bot_admin_ids":         database.GetSetting("bot_admin_ids"),
+		"telegram_user_id":       database.GetUserSetting(sessionUsername, "telegram_user_id"),
+		"bot_pool_upload_folder": func() string {
+			f := database.GetUserSetting(sessionUsername, "bot_pool_upload_folder")
+			if f == "" {
+				return "TelegramUpload"
+			}
+			return f
+		}(),
 	})
 }
 
@@ -1029,6 +1038,9 @@ func (h *Handler) handlePermanentDeleteFile(c *gin.Context) {
 	}
 
 	// Delete from DB
+	if item.ShareToken != nil {
+		database.DB.Exec("DELETE FROM share_sessions WHERE share_token = ?", *item.ShareToken)
+	}
 	if item.IsFolder {
 		oldPrefix := item.Path + "/" + item.Filename
 		if item.Path == "/" {
@@ -1676,7 +1688,7 @@ func (h *Handler) publicShareItem(origin string, fileID int64, shareMode, dbPath
 	}
 
 	shareToken := uuid.New().String()
-	_, err := database.DB.Exec("UPDATE files SET share_token = ? WHERE id = ?", shareToken, targetID)
+	_, err := database.DB.Exec("UPDATE files SET share_token = ?, share_password = NULL, share_views = 0, share_downloads = 0 WHERE id = ?", shareToken, targetID)
 	if err != nil {
 		fmt.Printf("[PublicAPI] Failed to update share token: %v\n", err)
 		return

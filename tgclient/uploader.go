@@ -1361,18 +1361,12 @@ func ProcessCompleteUploadSync(ctx context.Context, filePath, filename, path, mi
 	return fileID, uniqueFilename, nil
 }
 
-func DeleteMessages(ctx context.Context, cfg *config.Config, msgIDs []int) error {
-	if len(msgIDs) == 0 {
-		return nil
-	}
-	api := Client.API()
-	peer, err := resolveLogGroup(ctx, api, cfg.LogGroupID)
+func deleteMessagesWithClient(ctx context.Context, api *tg.Client, logGroupID string, msgIDs []int) error {
+	peer, err := resolveLogGroup(ctx, api, logGroupID)
 	if err != nil {
 		return err
 	}
 
-	// Telegram API limits deletion to 100 message IDs per request.
-	// Sending more than 100 at once will cause the request to fail silently.
 	const batchSize = 100
 	for i := 0; i < len(msgIDs); i += batchSize {
 		end := i + batchSize
@@ -1383,19 +1377,16 @@ func DeleteMessages(ctx context.Context, cfg *config.Config, msgIDs []int) error
 
 		switch p := peer.(type) {
 		case *tg.InputPeerChannel:
-			// Supergroup or channel (-100xxxxxxxxx)
 			_, err = api.ChannelsDeleteMessages(ctx, &tg.ChannelsDeleteMessagesRequest{
 				Channel: &tg.InputChannel{ChannelID: p.ChannelID, AccessHash: p.AccessHash},
 				ID:      batch,
 			})
 		case *tg.InputPeerChat:
-			// Basic group (negative ID, not -100 prefix)
 			_, err = api.MessagesDeleteMessages(ctx, &tg.MessagesDeleteMessagesRequest{
 				Revoke: true,
 				ID:     batch,
 			})
 		default:
-			// InputPeerSelf (saved messages) or InputPeerUser
 			_, err = api.MessagesDeleteMessages(ctx, &tg.MessagesDeleteMessagesRequest{
 				Revoke: true,
 				ID:     batch,
@@ -1403,8 +1394,45 @@ func DeleteMessages(ctx context.Context, cfg *config.Config, msgIDs []int) error
 		}
 
 		if err != nil {
-			return fmt.Errorf("DeleteMessages batch %d-%d: %w", i, end-1, err)
+			return err
 		}
+	}
+	return nil
+}
+
+func DeleteMessages(ctx context.Context, cfg *config.Config, msgIDs []int) error {
+	if len(msgIDs) == 0 {
+		return nil
+	}
+
+	// 1. Try deleting using the main user account client
+	if Client != nil {
+		if err := deleteMessagesWithClient(ctx, Client.API(), cfg.LogGroupID, msgIDs); err == nil {
+			return nil
+		}
+	}
+
+	// 2. Fallback to using the bots in the bot pool (since user client might not have permissions to delete bot messages)
+	BotPoolMu.RLock()
+	var botClients []*tg.Client
+	for _, bot := range BotPool {
+		if bot.Client != nil && !bot.Deleted {
+			botClients = append(botClients, bot.Client.API())
+		}
+	}
+	BotPoolMu.RUnlock()
+
+	var lastErr error
+	for _, botAPI := range botClients {
+		if err := deleteMessagesWithClient(ctx, botAPI, cfg.LogGroupID, msgIDs); err == nil {
+			return nil
+		} else {
+			lastErr = err
+		}
+	}
+
+	if lastErr != nil {
+		return fmt.Errorf("failed to delete messages with all clients: %w", lastErr)
 	}
 	return nil
 }

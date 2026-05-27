@@ -3,12 +3,16 @@ package tgclient
 import (
 	"bufio"
 	"context"
+	crypto_rand "crypto/rand"
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"log"
+	"mime"
 	"net"
 	"net/url"
 	"os"
+	"path"
 	"strconv"
 	"strings"
 	"sync"
@@ -27,6 +31,7 @@ import (
 	"github.com/gotd/td/telegram/auth"
 	"github.com/gotd/td/telegram/dcs"
 	"github.com/gotd/td/telegram/message"
+	"github.com/gotd/td/telegram/message/html"
 	"github.com/gotd/td/tg"
 )
 
@@ -49,6 +54,13 @@ var (
 
 	Dispatcher = tg.NewUpdateDispatcher()
 	tgMu       sync.Mutex
+
+	// botFileWorkers is a bounded channel used as a semaphore to limit concurrent
+	// bot file-processing goroutines. This prevents Telegram flood-wait errors
+	// when a user sends a large album or many files at once.
+	botFileWorkers = make(chan struct{}, 16)
+
+	AppConfig *config.Config
 )
 
 func IsAuthorized() bool {
@@ -261,6 +273,8 @@ func InitClient(cfg *config.Config, runAuthFlow bool) error {
 	tgMu.Lock()
 	defer tgMu.Unlock()
 
+	AppConfig = cfg
+
 	stopClientUnlocked() // Stop previous client if running
 	tgCtx, tgCancel = context.WithCancel(context.Background())
 	Dispatcher = tg.NewUpdateDispatcher()
@@ -315,9 +329,11 @@ func InitClient(cfg *config.Config, runAuthFlow bool) error {
 		if token == "" || isPrivateMe {
 			continue
 		}
-		// Create bot-specific options with database storage
 		botOptions := options
 		botOptions.SessionStorage = &DBSessionStorage{SessionID: token}
+		botDispatcher := tg.NewUpdateDispatcher()
+		registerBotUpdateHandlers(&botDispatcher, token)
+		botOptions.UpdateHandler = botDispatcher
 		botClient := telegram.NewClient(cfg.APIID, cfg.APIHash, botOptions)
 		BotPool = append(BotPool, BotInstance{Client: botClient, Token: token})
 	}
@@ -671,6 +687,8 @@ func UpdateBotPool(cfg *config.Config, newTokens []string) {
 	BotPoolMu.Lock()
 	defer BotPoolMu.Unlock()
 
+	AppConfig = cfg
+
 	log.Println("Updating Bot Pool dynamically...")
 
 	// 1. Stop all existing bots
@@ -721,6 +739,9 @@ func UpdateBotPool(cfg *config.Config, newTokens []string) {
 		}
 		botOptions := options
 		botOptions.SessionStorage = &DBSessionStorage{SessionID: token}
+		botDispatcher := tg.NewUpdateDispatcher()
+		registerBotUpdateHandlers(&botDispatcher, token)
+		botOptions.UpdateHandler = botDispatcher
 		botClient := telegram.NewClient(cfg.APIID, cfg.APIHash, botOptions)
 
 		botCtx, botCancel := context.WithCancel(tgCtx)
@@ -756,4 +777,401 @@ func UpdateBotPool(cfg *config.Config, newTokens []string) {
 			}(i)
 		}
 	}
+}
+
+func registerBotUpdateHandlers(dispatcher *tg.UpdateDispatcher, botToken string) {
+	// Only OnNewMessage: bot-only sessions only receive private DM updates.
+	// Registering OnNewChannelMessage is unnecessary and wastes cycles.
+	dispatcher.OnNewMessage(func(ctx context.Context, e tg.Entities, u *tg.UpdateNewMessage) error {
+		// Capture values before the goroutine — ctx will be released by the
+		// dispatcher once this handler returns, so we use Background() for
+		// the actual (potentially long-running) work.
+		msg := u.Message
+		entities := e
+		go func() {
+			botFileWorkers <- struct{}{}        // acquire slot
+			defer func() { <-botFileWorkers }() // release slot
+			workCtx := context.Background()
+			if err := handleBotNewMessage(workCtx, entities, msg, botToken); err != nil {
+				log.Printf("[BotPool] handleBotNewMessage error: %v", err)
+			}
+		}()
+		return nil
+	})
+}
+
+func cryptoRandInt64() (int64, error) {
+	var b [8]byte
+	_, err := crypto_rand.Read(b[:])
+	if err != nil {
+		return 0, err
+	}
+	return int64(binary.BigEndian.Uint64(b[:])), nil
+}
+
+// botMediaInfo holds normalized info extracted from any media type.
+type botMediaInfo struct {
+	doc      *tg.Document // non-nil for document/file
+	photo    *tg.Photo    // non-nil for compressed photo
+	size     int64
+	mimeType string
+	filename string
+}
+
+// extractBotMedia normalises MessageMediaDocument and MessageMediaPhoto into
+// a single botMediaInfo so the rest of the handler is media-type agnostic.
+func extractBotMedia(msg *tg.Message) (*botMediaInfo, bool) {
+	switch m := msg.Media.(type) {
+	case *tg.MessageMediaDocument:
+		doc, ok := m.Document.(*tg.Document)
+		if !ok {
+			return nil, false
+		}
+		// Clear thumbnails to prevent errors when forwarding/sending media
+		// because the sub-bot does not have access/permissions to resolve or fetch them.
+		doc.Thumbs = nil
+		doc.VideoThumbs = nil
+
+		info := &botMediaInfo{
+			doc:      doc,
+			size:     doc.Size,
+			mimeType: doc.MimeType,
+			filename: "file",
+		}
+		if info.mimeType == "" {
+			info.mimeType = "application/octet-stream"
+		}
+		for _, attr := range doc.Attributes {
+			if fAttr, ok := attr.(*tg.DocumentAttributeFilename); ok {
+				info.filename = fAttr.FileName
+				break
+			}
+		}
+		return info, true
+
+	case *tg.MessageMediaPhoto:
+		photo, ok := m.Photo.(*tg.Photo)
+		if !ok {
+			return nil, false
+		}
+		// Pick the largest photo size available.
+		var bestSize int64
+		for _, sz := range photo.Sizes {
+			if ps, ok := sz.(*tg.PhotoSize); ok {
+				if int64(ps.Size) > bestSize {
+					bestSize = int64(ps.Size)
+				}
+			}
+		}
+		if bestSize == 0 {
+			// PhotoSizeProgressive or unknown — use a small estimate
+			bestSize = 1
+		}
+		ts := time.Unix(int64(photo.Date), 0).UTC().Format("20060102_150405")
+		return &botMediaInfo{
+			photo:    photo,
+			size:     bestSize,
+			mimeType: "image/jpeg",
+			filename: "photo_" + ts + ".jpg",
+		}, true
+	}
+	return nil, false
+}
+
+func handleBotNewMessage(ctx context.Context, e tg.Entities, msgClass tg.MessageClass, botToken string) error {
+	msg, ok := msgClass.(*tg.Message)
+	if !ok {
+		return nil
+	}
+
+	// Only process private chats (direct messages user-to-bot). Ignore basic groups, channels, supergroups.
+	if _, ok := msg.PeerID.(*tg.PeerUser); !ok {
+		return nil
+	}
+
+	mediaInfo, ok := extractBotMedia(msg)
+	if !ok {
+		return nil
+	}
+
+	var senderUserID int64
+	if fromUser, ok := msg.FromID.(*tg.PeerUser); ok {
+		senderUserID = fromUser.UserID
+	} else if peerUser, ok := msg.PeerID.(*tg.PeerUser); ok {
+		senderUserID = peerUser.UserID
+	}
+
+	if senderUserID == 0 {
+		return nil
+	}
+
+	var ownerUsername string
+	query := "SELECT username FROM user_settings WHERE `key` = 'telegram_user_id' AND value = ?"
+	if database.IsPostgres() {
+		query = "SELECT username FROM user_settings WHERE \"key\" = 'telegram_user_id' AND value = ?"
+	} else if !database.IsMySQL() {
+		query = "SELECT username FROM user_settings WHERE key = 'telegram_user_id' AND value = ?"
+	}
+	err := database.RODB.Get(&ownerUsername, query, strconv.FormatInt(senderUserID, 10))
+	if err != nil || ownerUsername == "" {
+		return nil
+	}
+
+	var fromPeer tg.InputPeerClass
+	if peerUser, ok := msg.PeerID.(*tg.PeerUser); ok {
+		if u, ok := e.Users[peerUser.UserID]; ok {
+			fromPeer = &tg.InputPeerUser{UserID: u.ID, AccessHash: u.AccessHash}
+		}
+	} else if peerChat, ok := msg.PeerID.(*tg.PeerChat); ok {
+		fromPeer = &tg.InputPeerChat{ChatID: peerChat.ChatID}
+	} else if peerChannel, ok := msg.PeerID.(*tg.PeerChannel); ok {
+		if c, ok := e.Channels[peerChannel.ChannelID]; ok {
+			fromPeer = &tg.InputPeerChannel{ChannelID: c.ID, AccessHash: c.AccessHash}
+		}
+	}
+
+	if fromPeer == nil {
+		return nil
+	}
+
+	BotPoolMu.RLock()
+	var botClient *tg.Client
+	for _, bot := range BotPool {
+		if bot.Token == botToken {
+			botClient = bot.Client.API()
+			break
+		}
+	}
+	BotPoolMu.RUnlock()
+
+	if botClient == nil {
+		return fmt.Errorf("bot instance not found for token")
+	}
+
+	logGroupID := ""
+	if AppConfig != nil {
+		logGroupID = AppConfig.LogGroupID
+	}
+	if logGroupID == "" {
+		logGroupID = database.GetSetting("log_group_id")
+	}
+
+	toPeer, err := resolveLogGroup(ctx, botClient, logGroupID)
+	if err != nil {
+		log.Printf("[BotPool] Failed to resolve log group for forwarding: %v", err)
+		return nil
+	}
+
+	docSize := mediaInfo.size
+	docMimeType := mediaInfo.mimeType
+	docFilename := mediaInfo.filename
+
+	// Smart file format auto-detection for voice recordings, audio, video messages, or missing extensions.
+	// mime.ExtensionsByType returns extensions sorted alphabetically, which gives wrong results for many
+	// common types (e.g. video/mp4 → ".mpv" or ".m4v" instead of ".mp4"). Use a curated table first.
+	if docFilename == "file" || !strings.Contains(docFilename, ".") {
+		// Preferred extension table — takes priority over mime.ExtensionsByType.
+		preferredExt := map[string]string{
+			"video/mp4":                    ".mp4",
+			"video/webm":                   ".webm",
+			"video/x-matroska":             ".mkv",
+			"video/quicktime":              ".mov",
+			"video/x-msvideo":              ".avi",
+			"video/mpeg":                   ".mpeg",
+			"video/3gpp":                   ".3gp",
+			"audio/mpeg":                   ".mp3",
+			"audio/mp4":                    ".m4a",
+			"audio/ogg":                    ".ogg",
+			"audio/webm":                   ".weba",
+			"audio/wav":                    ".wav",
+			"audio/flac":                   ".flac",
+			"audio/x-flac":                 ".flac",
+			"audio/aac":                    ".aac",
+			"audio/opus":                   ".opus",
+			"image/jpeg":                   ".jpg",
+			"image/png":                    ".png",
+			"image/gif":                    ".gif",
+			"image/webp":                   ".webp",
+			"image/heic":                   ".heic",
+			"image/heif":                   ".heif",
+			"application/pdf":              ".pdf",
+			"application/zip":              ".zip",
+			"application/x-tar":            ".tar",
+			"application/gzip":             ".gz",
+			"application/x-7z-compressed":  ".7z",
+			"application/x-rar-compressed": ".rar",
+			"text/plain":                   ".txt",
+		}
+		if ext, ok := preferredExt[docMimeType]; ok {
+			docFilename = docFilename + ext
+		} else {
+			// Fallback: try mime package, but skip the first result if there are multiple
+			// (alphabetically first is often wrong, e.g. .m4v before .mp4).
+			exts, _ := mime.ExtensionsByType(docMimeType)
+			if len(exts) > 0 {
+				docFilename = docFilename + exts[0]
+			} else if strings.HasPrefix(docMimeType, "image/") {
+				docFilename = docFilename + ".jpg"
+			} else if strings.HasPrefix(docMimeType, "video/") {
+				docFilename = docFilename + ".mp4"
+			} else if strings.HasPrefix(docMimeType, "audio/") {
+				docFilename = docFilename + ".mp3"
+			}
+		}
+	}
+
+	// Standardized consistent HTML caption for forwarded files, stripping user's original caption
+	finalCaption := "<b>📄 File:</b> " + docFilename + "\n\n<b>🚀 Powered by TeleCloud Go</b>\n<i>Unlimited Cloud Storage via Telegram</i>\n\n🔗 <a href=\"https://github.com/dabeecao/telecloud-go\">GitHub Repository</a>"
+
+	sender := message.NewSender(botClient)
+	var updates tg.UpdatesClass
+	// Retry up to 3 times to handle transient FLOOD_WAIT from Telegram.
+	// Without retry, files sent during a burst are silently lost.
+	const maxRetries = 3
+	for attempt := 0; attempt < maxRetries; attempt++ {
+		if attempt > 0 {
+			backoff := time.Duration(attempt*attempt) * 5 * time.Second
+			log.Printf("[BotPool] Retrying forward to log group (attempt %d/%d) after %v", attempt+1, maxRetries, backoff)
+			time.Sleep(backoff)
+		}
+		if mediaInfo.doc != nil {
+			updates, err = sender.To(toPeer).Silent().Document(ctx, mediaInfo.doc, html.String(nil, finalCaption))
+		} else {
+			updates, err = sender.To(toPeer).Silent().Photo(ctx, mediaInfo.photo, html.String(nil, finalCaption))
+		}
+		if err == nil {
+			break
+		}
+		// If Telegram returns FLOOD_WAIT, respect the wait duration instead of a fixed backoff.
+		if secs, ok := ParseFloodWait(err); ok {
+			waitDur := time.Duration(secs+1) * time.Second
+			log.Printf("[BotPool] FLOOD_WAIT %ds while forwarding file — waiting before retry", secs)
+			time.Sleep(waitDur)
+		}
+	}
+	if err != nil {
+		log.Printf("[BotPool] Failed to send media to log group after %d attempts: %v", maxRetries, err)
+		return nil
+	}
+
+	var newMessageID int
+	switch u := updates.(type) {
+	case *tg.Updates:
+		for _, upd := range u.Updates {
+			if newMessage, ok := upd.(*tg.UpdateNewMessage); ok {
+				newMessageID = newMessage.Message.GetID()
+			} else if newChannelMessage, ok := upd.(*tg.UpdateNewChannelMessage); ok {
+				newMessageID = newChannelMessage.Message.GetID()
+			}
+		}
+	case *tg.UpdatesCombined:
+		for _, upd := range u.Updates {
+			if newMessage, ok := upd.(*tg.UpdateNewMessage); ok {
+				newMessageID = newMessage.Message.GetID()
+			} else if newChannelMessage, ok := upd.(*tg.UpdateNewChannelMessage); ok {
+				newMessageID = newChannelMessage.Message.GetID()
+			}
+		}
+	case *tg.UpdateShortSentMessage:
+		newMessageID = u.ID
+	}
+
+	if newMessageID == 0 {
+		log.Printf("[BotPool] Could not extract sent message ID")
+		return nil
+	}
+
+	folderName := ""
+	folderQuery := "SELECT value FROM user_settings WHERE username = ? AND `key` = 'bot_pool_upload_folder'"
+	if database.IsPostgres() {
+		folderQuery = "SELECT value FROM user_settings WHERE username = ? AND \"key\" = 'bot_pool_upload_folder'"
+	} else if !database.IsMySQL() {
+		folderQuery = "SELECT value FROM user_settings WHERE username = ? AND key = 'bot_pool_upload_folder'"
+	}
+	_ = database.RODB.Get(&folderName, folderQuery, ownerUsername)
+	// Sanitize: mirror the same rules applied in handlePostBotUserSettings.
+	// Prevents path traversal if the DB row was ever set by an older version.
+	if cleaned := path.Clean(folderName); cleaned == "" || cleaned == "." || cleaned == "/" || strings.HasPrefix(cleaned, "..") {
+		folderName = "TelegramUpload"
+	} else {
+		folderName = strings.Trim(cleaned, "/")
+	}
+	if folderName == "" {
+		folderName = "TelegramUpload"
+	}
+
+	adminUsername := database.GetSetting("admin_username")
+	if adminUsername == "" {
+		adminUsername = "admin"
+	}
+
+	var folderPath string
+	if ownerUsername == adminUsername {
+		folderPath = "/" + folderName
+	} else {
+		folderPath = "/" + ownerUsername + "/" + folderName
+	}
+
+	err = database.EnsureFoldersExist(folderPath, ownerUsername)
+	if err != nil {
+		log.Printf("[BotPool] Failed to ensure folders exist for %s: %v", ownerUsername, err)
+		return nil
+	}
+
+	unlockInsert := database.AcquireFileInsertLock(ownerUsername, folderPath)
+	uniqueFilename := database.GetUniqueFilename(database.RODB, folderPath, docFilename, false, 0, ownerUsername)
+
+	tx, err := database.DB.Beginx()
+	if err != nil {
+		unlockInsert()
+		log.Printf("[BotPool] Failed to start DB transaction: %v", err)
+		return nil
+	}
+	defer tx.Rollback()
+
+	fileID, err := database.InsertAndGetID(tx,
+		"INSERT INTO files (filename, path, size, mime_type, is_folder, owner, message_id) VALUES (?, ?, ?, ?, 0, ?, ?)",
+		uniqueFilename, folderPath, docSize, docMimeType, ownerUsername, newMessageID,
+	)
+	_ = fileID // suppress unused warning if InsertAndGetID returns int
+	if err != nil {
+		unlockInsert()
+		log.Printf("[BotPool] Failed to insert file record: %v", err)
+		return nil
+	}
+
+	_, err = tx.Exec(
+		"INSERT INTO file_parts (file_id, message_id, part_index, size) VALUES (?, ?, ?, ?)",
+		fileID, newMessageID, 0, docSize,
+	)
+	if err != nil {
+		unlockInsert()
+		log.Printf("[BotPool] Failed to insert file part: %v", err)
+		return nil
+	}
+
+	err = tx.Commit()
+	unlockInsert()
+	if err != nil {
+		log.Printf("[BotPool] Failed to commit DB transaction: %v", err)
+		return nil
+	}
+
+	// Send English confirmation message back to the Telegram sender via the sub-bot (non-blocking)
+	cleanRelFolder := strings.TrimPrefix(strings.TrimPrefix(folderPath, "/"+ownerUsername), "/")
+	if cleanRelFolder == "" {
+		cleanRelFolder = "/"
+	}
+	confirmText := fmt.Sprintf("✅ <b>Successfully received file:</b> <code>%s</code>\n📂 <b>Folder:</b> <code>/%s</code>\n☁️ <b>TeleCloud upload completed!</b>", uniqueFilename, cleanRelFolder)
+	confirmMsgOpt := html.String(nil, confirmText)
+	go func() {
+		botSender := message.NewSender(botClient)
+		_, sendErr := botSender.To(fromPeer).Silent().StyledText(context.Background(), confirmMsgOpt)
+		if sendErr != nil {
+			log.Printf("[BotPool] Failed to send confirmation response to user %d: %v", senderUserID, sendErr)
+		}
+	}()
+
+	log.Printf("[BotPool] Successfully received, forwarded, and recorded file %s (%d bytes) in %s belonging to %s as message %d", uniqueFilename, docSize, folderPath, ownerUsername, newMessageID)
+	return nil
 }

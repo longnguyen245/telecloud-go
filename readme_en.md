@@ -49,7 +49,7 @@
 * ⚡ **Background Tasks**: Background URL downloads with real-time progress notifications.
 * 🧲 **Torrent Support**: Download Torrents and Magnet links directly to Telegram via **aria2c**.
 * 👥 **Multi-user**: Support for child accounts with isolated storage spaces (Virtual Path).
-* 🤖 **Bot Pool**: Use secondary bots to balance load, maximizing speed and reliability.
+* 🤖 **Multi-Bot (Bot Pool) & Personal File Receipt**: Distribute workloads across multiple secondary bots to maximize speed and reliability. Also allows each user (including child accounts) to link their personal Telegram account to instantly upload and organize files sent directly to any bot in the Bot Pool into their own storage workspace.
 * 🔐 **Passkey Security**: Biometric login (Fingerprint, FaceID) or security keys (WebAuthn).
 * 🗄️ **Multi-Database**: Supports **SQLite**, **MySQL**, and **PostgreSQL** for enterprise-scale needs.
 * 🗑️ **Trash Bin**: Recover deleted files and protect data from accidental removal.

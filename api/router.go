@@ -21,12 +21,21 @@ func SetupRouter(cfg *config.Config, contentFS fs.FS, startTG func(cfg *config.C
 
 	staticFS, err := fs.Sub(contentFS, "static")
 	if err == nil {
-		r.StaticFS("/static", http.FS(staticFS))
+		staticGroup := r.Group("/static")
+		staticGroup.Use(func(c *gin.Context) {
+			// Cache-Control: max-age=31536000 (1 year) for static assets.
+			// Because assets are versioned using query params (?v=...) or chunk hashes,
+			// it is safe to cache them aggressively and avoid unnecessary 304 network roundtrips.
+			c.Header("Cache-Control", "public, max-age=31536000, immutable")
+			c.Next()
+		})
+		staticGroup.StaticFS("", http.FS(staticFS))
 	}
 
 	h := NewHandler(cfg, contentFS, startTG, restartApp)
 
 	r.Use(securityHeadersMiddleware())
+	r.Use(gzipMiddleware())
 	r.Use(setupCheckMiddleware())
 
 	// WebDAV Route
@@ -128,6 +137,8 @@ func SetupRouter(cfg *config.Config, contentFS fs.FS, startTG func(cfg *config.C
 		api.POST("/settings/s3/credentials", h.handlePostS3Credentials)
 		api.POST("/settings/child-s3", h.handlePostChildS3)
 		api.GET("/settings/user", h.handleGetUserSettings)
+		api.GET("/settings/bot-user", h.handleGetBotUserSettings)
+		api.POST("/settings/bot-user", h.handlePostBotUserSettings)
 		api.POST("/settings/user/theme", h.handlePostUserTheme)
 		api.GET("/settings/child-api-key", h.handleGetChildAPIKey)
 		api.POST("/settings/child-api-key", h.handlePostChildAPIKey)
@@ -157,6 +168,7 @@ func SetupRouter(cfg *config.Config, contentFS fs.FS, startTG func(cfg *config.C
 		api.POST("/cancel_upload", h.handleCancelUpload)
 		api.POST("/actions/paste", h.handlePostPaste)
 		api.GET("/trash", h.handleGetTrashFiles)
+		api.GET("/shares", h.handleGetShares)
 		api.DELETE("/trash", h.handleEmptyTrash)
 		api.GET("/thumb/backup-local", h.handleBackupLocalThumb)
 		api.DELETE("/files/:id", h.handleDeleteFile)

@@ -3,7 +3,9 @@ package api
 import (
 	"fmt"
 	"net/http"
+	"path"
 	"regexp"
+	"strconv"
 	"strings"
 	"telecloud/database"
 	"telecloud/tgclient"
@@ -197,6 +199,90 @@ func (h *Handler) handlePostUserTheme(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to save theme"})
 		return
 	}
+	c.JSON(http.StatusOK, gin.H{"status": "success"})
+}
+
+func (h *Handler) handleGetBotUserSettings(c *gin.Context) {
+	username := c.GetString("username")
+	telegramUserID := database.GetUserSetting(username, "telegram_user_id")
+	botPoolUploadFolder := database.GetUserSetting(username, "bot_pool_upload_folder")
+	if botPoolUploadFolder == "" {
+		botPoolUploadFolder = "TelegramUpload"
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"telegram_user_id":         telegramUserID,
+		"bot_pool_upload_folder": botPoolUploadFolder,
+	})
+}
+
+func (h *Handler) handlePostBotUserSettings(c *gin.Context) {
+	username := c.GetString("username")
+	var req struct {
+		TelegramUserID      string `json:"telegram_user_id"`
+		BotPoolUploadFolder string `json:"bot_pool_upload_folder"`
+	}
+
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request body"})
+		return
+	}
+
+	req.TelegramUserID = strings.TrimSpace(req.TelegramUserID)
+	req.BotPoolUploadFolder = strings.TrimSpace(req.BotPoolUploadFolder)
+
+	// Validate telegram_user_id is numeric string if not empty
+	if req.TelegramUserID != "" {
+		if _, err := strconv.ParseInt(req.TelegramUserID, 10, 64); err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "err_invalid_telegram_user_id"})
+			return
+		}
+
+		// Verify uniqueness across all accounts where key = 'telegram_user_id' and username != current_username
+		var existingUsername string
+		query := "SELECT username FROM user_settings WHERE `key` = 'telegram_user_id' AND value = ? AND username != ?"
+		if database.IsPostgres() {
+			query = "SELECT username FROM user_settings WHERE \"key\" = 'telegram_user_id' AND value = ? AND username != ?"
+		} else if !database.IsMySQL() {
+			query = "SELECT username FROM user_settings WHERE key = 'telegram_user_id' AND value = ? AND username != ?"
+		}
+		err := database.RODB.Get(&existingUsername, query, req.TelegramUserID, username)
+		if err == nil && existingUsername != "" {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "err_telegram_user_id_exists"})
+			return
+		}
+	}
+
+	if req.BotPoolUploadFolder == "" {
+		req.BotPoolUploadFolder = "TelegramUpload"
+	}
+
+	// Clean up upload folder name: no leading/trailing slashes, no dot-dots
+	folder := path.Clean(req.BotPoolUploadFolder)
+	if folder == "." || folder == "/" || strings.HasPrefix(folder, "..") {
+		folder = "TelegramUpload"
+	}
+
+	// If current user is the admin, ensure the folder doesn't conflict with any child account paths
+	isAdmin := c.GetBool("is_admin")
+	if isAdmin {
+		if isChildAccountPath("/" + folder) {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "err_folder_collides_child"})
+			return
+		}
+	}
+
+	err := database.SetUserSetting(username, "telegram_user_id", req.TelegramUserID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to save telegram user id"})
+		return
+	}
+
+	err = database.SetUserSetting(username, "bot_pool_upload_folder", folder)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to save bot pool upload folder"})
+		return
+	}
+
 	c.JSON(http.StatusOK, gin.H{"status": "success"})
 }
 
@@ -530,7 +616,9 @@ func (h *Handler) handlePostBotPool(c *gin.Context) {
 	}
 
 	var req struct {
-		Tokens []string `json:"tokens"`
+		Tokens       []string `json:"tokens"`
+		AdminIDs     string   `json:"admin_ids"`
+		UploadFolder string   `json:"upload_folder"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request body"})
@@ -599,6 +687,8 @@ func (h *Handler) handlePostBotPool(c *gin.Context) {
 
 	tokensStr := strings.Join(validTokens, ",")
 	database.SetSetting("bot_tokens", tokensStr)
+	database.SetSetting("bot_admin_ids", req.AdminIDs)
+	database.SetSetting("bot_pool_upload_folder", req.UploadFolder)
 
 	// Dynamic update in-memory
 	tgclient.UpdateBotPool(h.cfg, validTokens)

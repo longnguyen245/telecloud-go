@@ -1,6 +1,11 @@
 package api
 
 import (
+	"bufio"
+	"compress/gzip"
+	"fmt"
+	"io"
+	"net"
 	"net/http"
 	"strings"
 	"sync"
@@ -273,6 +278,74 @@ func authMiddleware() gin.HandlerFunc {
 
 		c.Set("username", sessionUsername)
 		c.Set("is_admin", isAdmin)
+		c.Next()
+	}
+}
+
+type gzipResponseWriter struct {
+	gin.ResponseWriter
+	writer io.Writer
+}
+
+func (g *gzipResponseWriter) Write(data []byte) (int, error) {
+	return g.writer.Write(data)
+}
+
+func (g *gzipResponseWriter) WriteString(s string) (int, error) {
+	return g.writer.Write([]byte(s))
+}
+
+// Hijack implements http.Hijacker to support WebSockets, WebDAV, and proxy protocols
+func (g *gzipResponseWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	if hijacker, ok := g.ResponseWriter.(http.Hijacker); ok {
+		return hijacker.Hijack()
+	}
+	return nil, nil, fmt.Errorf("underlying ResponseWriter does not implement http.Hijacker")
+}
+
+// Flush implements http.Flusher to support SSE, chunked streaming, and keep-alive responses
+func (g *gzipResponseWriter) Flush() {
+	if flusher, ok := g.ResponseWriter.(http.Flusher); ok {
+		flusher.Flush()
+	}
+	if gzw, ok := g.writer.(*gzip.Writer); ok {
+		gzw.Flush()
+	}
+}
+
+func gzipMiddleware() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		// Only compress when client accepts gzip
+		if !strings.Contains(c.GetHeader("Accept-Encoding"), "gzip") {
+			c.Next()
+			return
+		}
+
+		// Avoid compressing stream, download, WebDAV, S3, WebSocket, and large comic/epub page binary data
+		path := c.Request.URL.Path
+		if strings.Contains(path, "/stream") || 
+			strings.Contains(path, "/dl") || 
+			strings.Contains(path, "/download/") ||
+			strings.Contains(path, "/cbz/page") ||
+			strings.Contains(path, "/epub/resource") ||
+			strings.HasPrefix(path, "/webdav") ||
+			strings.HasPrefix(path, "/s3") ||
+			strings.HasPrefix(path, "/api/ws") {
+			c.Next()
+			return
+		}
+
+		gz, err := gzip.NewWriterLevel(c.Writer, gzip.BestSpeed)
+		if err != nil {
+			c.Next()
+			return
+		}
+		defer gz.Close()
+
+		c.Header("Content-Encoding", "gzip")
+		c.Header("Vary", "Accept-Encoding")
+		
+		c.Writer = &gzipResponseWriter{c.Writer, gz}
 		c.Next()
 	}
 }

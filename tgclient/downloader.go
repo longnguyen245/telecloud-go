@@ -39,7 +39,7 @@ func init() {
 }
 
 type cachedLocation struct {
-	loc       *tg.InputDocumentFileLocation
+	loc       tg.InputFileLocationClass
 	api       *tg.Client // Store the API client that resolved this location
 	expiresAt time.Time
 }
@@ -315,7 +315,7 @@ var getSinglePartReader = func(ctx context.Context, msgID int, size int64, cfg *
 	}
 
 	// Helper function to resolve media from a specific API client
-	resolve := func(targetApi *tg.Client) (*tg.InputDocumentFileLocation, error) {
+	resolve := func(targetApi *tg.Client) (tg.InputFileLocationClass, error) {
 		peer, err := resolveLogGroup(ctx, targetApi, cfg.LogGroupID)
 		if err != nil {
 			return nil, err
@@ -367,17 +367,62 @@ var getSinglePartReader = func(ctx context.Context, msgID int, size int64, cfg *
 			return nil, fmt.Errorf("message has no media")
 		}
 
-		docMedia, ok := msg.Media.(*tg.MessageMediaDocument)
-		if !ok {
-			return nil, fmt.Errorf("media is not a document")
+		if docMedia, ok := msg.Media.(*tg.MessageMediaDocument); ok {
+			doc, ok := docMedia.Document.(*tg.Document)
+			if !ok {
+				return nil, fmt.Errorf("document is empty")
+			}
+			return doc.AsInputDocumentFileLocation(), nil
 		}
 
-		doc, ok := docMedia.Document.(*tg.Document)
-		if !ok {
-			return nil, fmt.Errorf("document is empty")
+		if photoMedia, ok := msg.Media.(*tg.MessageMediaPhoto); ok {
+			photo, ok := photoMedia.Photo.(*tg.Photo)
+			if !ok {
+				return nil, fmt.Errorf("photo is empty")
+			}
+			// Find the best photo size available (largest w/h/size)
+			var bestSizeClass tg.PhotoSizeClass
+			var maxArea int
+			for _, sz := range photo.Sizes {
+				switch s := sz.(type) {
+				case *tg.PhotoSize:
+					area := s.W * s.H
+					if area > maxArea {
+						maxArea = area
+						bestSizeClass = sz
+					}
+				case *tg.PhotoSizeProgressive:
+					area := s.W * s.H
+					if area > maxArea {
+						maxArea = area
+						bestSizeClass = sz
+					}
+				case *tg.PhotoCachedSize:
+					area := s.W * s.H
+					if area > maxArea {
+						maxArea = area
+						bestSizeClass = sz
+					}
+				}
+			}
+
+			if bestSizeClass == nil && len(photo.Sizes) > 0 {
+				bestSizeClass = photo.Sizes[len(photo.Sizes)-1]
+			}
+
+			if bestSizeClass == nil {
+				return nil, fmt.Errorf("no valid photo sizes found")
+			}
+
+			return &tg.InputPhotoFileLocation{
+				ID:            photo.ID,
+				AccessHash:    photo.AccessHash,
+				FileReference: photo.FileReference,
+				ThumbSize:     bestSizeClass.GetType(),
+			}, nil
 		}
 
-		return doc.AsInputDocumentFileLocation(), nil
+		return nil, fmt.Errorf("media type not supported for download: %T", msg.Media)
 	}
 
 	api := GetAPI()
