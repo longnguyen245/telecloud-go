@@ -124,7 +124,7 @@ func (h *Handler) handleGetIndex(c *gin.Context) {
 		"storage_used":          userStorageUsed,
 		"theme":                 database.GetUserSetting(sessionUsername, "theme"),
 		"force_change":          forcePasswordChange,
-		"log_group_id":          database.GetSetting("log_group_id"),
+		"log_group_id":          h.cfg.LogGroupID,
 		"bot_tokens":            database.GetSetting("bot_tokens"),
 		"bot_statuses":          botStatusesStr,
 		"bot_admin_ids":         database.GetSetting("bot_admin_ids"),

@@ -88,7 +88,7 @@ func executeRestart() {
 }
 
 var (
-	version = "v3.7.3"
+	version = "v3.7.4"
 	commit  = "none"
 	date    = "unknown"
 )
@@ -218,7 +218,9 @@ func main() {
 			tgErrCh <- tgclient.Run(appCtx, newCfg, func(ctx context.Context) error {
 				if err := tgclient.VerifyLogGroup(ctx, newCfg); err != nil {
 					log.Printf("Warning: Log Group verification failed: %v", err)
+					tgclient.SetSystemReady(false)
 				}
+				tgclient.SetInitializationDone(true)
 				printStartupBox(newCfg)
 				log.Println("Starting TeleCloud on port " + newCfg.Port + "...")
 				<-ctx.Done()

@@ -61,6 +61,8 @@ var (
 	botFileWorkers = make(chan struct{}, 16)
 
 	AppConfig *config.Config
+	UserbotCooldownUntil time.Time
+	initializationDone int32
 )
 
 func IsAuthorized() bool {
@@ -73,6 +75,26 @@ func IsRunning() bool {
 
 func IsSystemReady() bool {
 	return atomic.LoadInt32(&systemReady) == 1
+}
+
+func IsInitializationDone() bool {
+	return atomic.LoadInt32(&initializationDone) == 1
+}
+
+func SetInitializationDone(done bool) {
+	if done {
+		atomic.StoreInt32(&initializationDone, 1)
+	} else {
+		atomic.StoreInt32(&initializationDone, 0)
+	}
+}
+
+func SetSystemReady(ready bool) {
+	if ready {
+		atomic.StoreInt32(&systemReady, 1)
+	} else {
+		atomic.StoreInt32(&systemReady, 0)
+	}
 }
 
 func GetAuthStatus(ctx context.Context) (*auth.Status, error) {
@@ -106,12 +128,28 @@ func GetAPI() *tg.Client {
 		}
 	}
 
-	total := uint32(len(activeIndices) + 1)
-	idx := atomic.AddUint32(&botCounter, 1) % total
-	if idx == 0 {
+	userbotActive := now.After(UserbotCooldownUntil)
+
+	// If everything is rate-limited, fallback to Client.API()
+	if len(activeIndices) == 0 && !userbotActive {
 		return Client.API()
 	}
-	return BotPool[activeIndices[idx-1]].Client.API()
+
+	var total uint32
+	if userbotActive {
+		total = uint32(len(activeIndices) + 1)
+	} else {
+		total = uint32(len(activeIndices))
+	}
+
+	idx := atomic.AddUint32(&botCounter, 1) % total
+	if userbotActive {
+		if idx == 0 {
+			return Client.API()
+		}
+		return BotPool[activeIndices[idx-1]].Client.API()
+	}
+	return BotPool[activeIndices[idx]].Client.API()
 }
 
 func MarkBotCooldown(api *tg.Client, seconds int) {
@@ -120,6 +158,14 @@ func MarkBotCooldown(api *tg.Client, seconds int) {
 
 	now := time.Now()
 	cooldownTime := now.Add(time.Duration(seconds) * time.Second)
+
+	if api == Client.API() {
+		if UserbotCooldownUntil.Before(cooldownTime) {
+			UserbotCooldownUntil = cooldownTime
+			log.Printf("[BotPool] Main Userbot is rate-limited. Cooling down for %d seconds...", seconds)
+		}
+		return
+	}
 
 	for i := range BotPool {
 		if BotPool[i].Client.API() == api {
@@ -267,6 +313,8 @@ func stopClientUnlocked() {
 		tgCancel()
 		tgCancel = nil
 	}
+	atomic.StoreInt32(&systemReady, 0)
+	atomic.StoreInt32(&initializationDone, 0)
 }
 
 func InitClient(cfg *config.Config, runAuthFlow bool) error {
@@ -1137,16 +1185,6 @@ func handleBotNewMessage(ctx context.Context, e tg.Entities, msgClass tg.Message
 	if err != nil {
 		unlockInsert()
 		log.Printf("[BotPool] Failed to insert file record: %v", err)
-		return nil
-	}
-
-	_, err = tx.Exec(
-		"INSERT INTO file_parts (file_id, message_id, part_index, size) VALUES (?, ?, ?, ?)",
-		fileID, newMessageID, 0, docSize,
-	)
-	if err != nil {
-		unlockInsert()
-		log.Printf("[BotPool] Failed to insert file part: %v", err)
 		return nil
 	}
 

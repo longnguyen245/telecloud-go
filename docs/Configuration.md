@@ -75,6 +75,26 @@ server {
         proxy_set_header Host $host;
         proxy_read_timeout 3600s;
     }
+
+    # Hỗ trợ S3 API (Xác thực chữ ký được tối giản hóa để đạt độ tương thích 100%)
+    # Hỗ trợ mọi ứng dụng khách S3 (Rclone, Cyberduck, Infuse, v.v.) qua mọi Proxy/Cloudflare.
+    location /s3 {
+        # Khuyên dùng $http_host để truyền Host gốc chính xác
+        proxy_set_header Host $http_host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+
+        # Tắt bộ đệm để truyền file dung lượng lớn qua S3 ổn định hơn
+        proxy_request_buffering off;
+        proxy_buffering off;
+        client_max_body_size 0;
+
+        # Cực kỳ quan trọng: KHÔNG THÊM dấu gạch chéo '/' ở cuối proxy_pass!
+        # Việc thêm dấu gạch chéo cuối sẽ kích hoạt tính năng chuẩn hóa URI của Nginx,
+        # làm giải mã ký tự đặc biệt %2F và cắt bỏ tiền tố /s3 dẫn tới sai chữ ký.
+        proxy_pass http://127.0.0.1:8091;
+    }
 }
 ```
 
@@ -133,6 +153,26 @@ server {
         proxy_http_version 1.1;
         proxy_set_header Upgrade $http_upgrade;
         proxy_set_header Connection "upgrade";
+    }
+
+    # S3 API Support (Signature verification relaxed for 100% client compatibility)
+    # Supports all S3 clients (Rclone, Cyberduck, Infuse, etc.) seamlessly behind any Proxy/Cloudflare.
+    location /s3 {
+        # Recommended to use $http_host to pass the correct host header
+        proxy_set_header Host $http_host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+
+        # Disable buffering to allow stable large S3 uploads
+        proxy_request_buffering off;
+        proxy_buffering off;
+        client_max_body_size 0;
+
+        # Crucial: DO NOT add a trailing slash '/' at the end of proxy_pass!
+        # A trailing slash forces Nginx to decode/normalize URI path (e.g. decodes %2F to /)
+        # and strips the '/s3' prefix, which breaks S3 signature verification.
+        proxy_pass http://127.0.0.1:8091;
     }
 }
 ```
