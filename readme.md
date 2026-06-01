@@ -37,9 +37,10 @@
 ## ✨ Tính năng
 
 * 📁 **Lưu trữ không giới hạn**: Lưu file trực tiếp trên Telegram **không giới hạn dung lượng** (Tự động chia nhỏ file siêu lớn thành các mảnh từ 500MB đến 4GB).
-* 🎬 **Phát phương tiện & Phụ đề**: Phát video và nhạc trực tiếp trong trang quản lý và liên kết chia sẻ. Tích hợp tính năng tự động quét/nạp phụ đề rời cùng tên (`.srt`, `.vtt`, `.ass`) hoặc tải lên thủ công từ thiết bị của bạn.
+* 🎬 **Phát phương tiện & Phụ đề**: Phát video và nhạc trực tiếp trong trang quản lý và liên kết chia sẻ. Tích hợp tính năng tự động quét/nạp phụ đề rời cùng tên (`.srt`, `.vtt`, `.ass`) hoặc tải lên thủ công từ thiết bị của bạn. Hỗ trợ các phím tắt điều khiển tiện lợi (`Space` để phát/tạm dừng, `Mũi tên Trái/Phải` để tua nhanh 5s, `Mũi tên Lên/Xuống` để tăng giảm âm lượng, `N` để chuyển bài tiếp theo, `P` để về bài trước).
 * 📚 **Đọc sách & Comic online**: Tích hợp các trình đọc trực quan cao cấp cho sách điện tử **EPUB**, truyện tranh **CBZ** (Webtoon mode, tự động lưu tiến trình đọc, tải trang thông minh), và tài liệu **PDF** trực tiếp trên trình duyệt mà không cần tải về.
 * 🔗 **Chia sẻ linh hoạt**: Hỗ trợ liên kết thường hoặc link tải trực tiếp (Direct Link), hỗ trợ chia sẻ cả **Thư mục**.
+* ⚡ **Nén & Tải thư mục trực tiếp**: Tải toàn bộ thư mục về máy dưới dạng ZIP tức thì (Server-Side On-The-Fly ZIP Streaming) không thông qua ổ cứng máy chủ để tối ưu bộ nhớ và băng thông (chỉ áp dụng cho người dùng đã đăng nhập).
 * 🗂️ **Quản lý trực quan**: Giao diện File Browser hỗ trợ chế độ xem **Lưới (Grid)** và **Danh sách (List)**.
 * ⬆️ **Tốc độ tối ưu**: Upload song song (Multi-threading) và chia nhỏ (chunk) để tối ưu tốc độ và ổn định.
 * 📂 **Hỗ trợ WebDAV**: Gắn TeleCloud thành ổ đĩa mạng trên máy tính (Windows, macOS, Linux).

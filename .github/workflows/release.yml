@@ -38,13 +38,52 @@ jobs:
           chmod +x build-frontend.sh
           ./build-frontend.sh
 
+      - name: Generate Custom Changelog
+        run: |
+          echo "## 🚀 What's New" > custom_changelog.md
+          
+          # Find latest tag safely
+          PREV_TAG=$(git describe --tags --abbrev=0 HEAD^ 2>/dev/null || echo "")
+          
+          if [ -n "$PREV_TAG" ]; then
+            echo "### 🖥️ Backend & API Changes" >> custom_changelog.md
+            git log $PREV_TAG..HEAD --oneline --no-merges 2>/dev/null | sed 's/^/- /' >> custom_changelog.md || true
+            
+            # Submodule changes
+            OLD_SUB_SHA=$(git rev-parse $PREV_TAG:web 2>/dev/null || echo "")
+            NEW_SUB_SHA=$(git rev-parse HEAD:web 2>/dev/null || echo "")
+            
+            if [ -n "$OLD_SUB_SHA" ] && [ -n "$NEW_SUB_SHA" ] && [ "$OLD_SUB_SHA" != "$NEW_SUB_SHA" ]; then
+              echo "" >> custom_changelog.md
+              echo "### 🌐 Web Frontend Changes" >> custom_changelog.md
+              cd web
+              # Fetch origin history to ensure both SHAs exist in the checked out submodule
+              git fetch origin $OLD_SUB_SHA $NEW_SUB_SHA --depth=50 2>/dev/null || git fetch origin 2>/dev/null || true
+              git log $OLD_SUB_SHA..$NEW_SUB_SHA --oneline --no-merges 2>/dev/null | sed 's/^/- /' >> ../custom_changelog.md || echo "- Web updated from \`$OLD_SUB_SHA\` to \`$NEW_SUB_SHA\`" >> ../custom_changelog.md
+              cd ..
+            fi
+          else
+            echo "### 🖥️ Backend & API Changes" >> custom_changelog.md
+            git log --oneline --no-merges 2>/dev/null | sed 's/^/- /' >> custom_changelog.md || true
+            
+            echo "" >> custom_changelog.md
+            echo "### 🌐 Web Frontend Changes" >> custom_changelog.md
+            cd web
+            git log --oneline --no-merges -n 20 2>/dev/null | sed 's/^/- /' >> ../custom_changelog.md || true
+            cd ..
+          fi
+          
+          echo "" >> custom_changelog.md
+          echo "---" >> custom_changelog.md
+          echo "*Generated automatically during release build.*" >> custom_changelog.md
+
       - name: Run GoReleaser
         if: startsWith(github.ref, 'refs/tags/')
         uses: goreleaser/goreleaser-action@v6
         with:
           distribution: goreleaser
           version: "~> v2"
-          args: release --clean --parallelism 1 --skip=validate
+          args: release --clean --parallelism 1 --skip=validate --release-notes=custom_changelog.md
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           DEFAULT_API_ID: ${{ secrets.DEFAULT_API_ID }}

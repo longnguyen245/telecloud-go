@@ -37,9 +37,10 @@
 ## ✨ Features
 
 * 📁 **Unlimited Storage**: Store files directly on Telegram with **no size limits** (Automatically splits large files into chunks from 500MB to 4GB).
-* 🎬 **Media & Subtitles Streaming**: Stream videos and music directly in the dashboard and shared links. Seamlessly auto-scans and loads subtitles (.srt, .vtt, .ass) with matching names, or manually uploads external subtitles from your computer.
+* 🎬 **Media & Subtitles Streaming**: Stream videos and music directly in the dashboard and shared links. Seamlessly auto-scans and loads subtitles (.srt, .vtt, .ass) with matching names, or manually uploads external subtitles from your computer. Supports convenient shortcut keys (`Space` to play/pause, `Left/Right Arrows` to seek 5s, `Up/Down Arrows` for volume, `N` for next track, and `P` for previous track).
 * 📚 **EPUB, Comic & PDF Readers**: Integrates custom, high-fidelity online readers for **EPUB** e-books, **CBZ** comic books (Webtoon scroll mode, lazy-loading, automatic progress preservation), and **PDF** documents directly within the browser without downloading.
 * 🔗 **Flexible Sharing**: Supports normal or direct download links (Direct Link) for both files and **folders**.
+* ⚡ **On-The-Fly Folder Download**: Supports high-performance, diskless server-side ZIP streaming to download entire directories instantly without using any server disk storage (exclusively restricted to logged-in users for optimal efficiency).
 * 🗂️ **Intuitive Management**: File Browser with **Grid** and **List** view modes.
 * ⬆️ **High Performance**: Multi-threaded and chunked uploads for maximum speed and stability.
 * 📂 **WebDAV Support**: Mount TeleCloud as a network drive on Windows, macOS, and Linux.

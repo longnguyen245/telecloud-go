@@ -1,6 +1,7 @@
 package api
 
 import (
+	"archive/zip"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -1746,3 +1747,89 @@ func (h *Handler) handlePublicShareAPI(c *gin.Context) {
 	h.publicShareItem(getRequestOrigin(c), item.ID, shareMode, dbPath, username, resp)
 	c.JSON(http.StatusOK, resp)
 }
+
+func (h *Handler) handleDownloadFolder(c *gin.Context) {
+	id, err := strconv.Atoi(c.Param("id"))
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid_id"})
+		return
+	}
+	var folder database.File
+	username := c.GetString("username")
+	if err := database.RODB.Get(&folder, "SELECT * FROM files WHERE id = ? AND owner = ? AND deleted_at IS NULL", id, username); err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "Folder not found"})
+		return
+	}
+	if !folder.IsFolder {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Not a folder"})
+		return
+	}
+
+	zipName := folder.Filename + ".zip"
+	c.Header("Content-Disposition", fmt.Sprintf(`attachment; filename="%s"`, zipName))
+	c.Header("Content-Type", "application/zip")
+	c.Header("X-Accel-Buffering", "no")
+	c.SetCookie("dl_started", "1", 15, "/", "", false, false)
+
+	folderPrefix := folder.Path + "/" + folder.Filename
+	if folder.Path == "/" {
+		folderPrefix = "/" + folder.Filename
+	}
+
+	var allItems []database.File
+	err = database.RODB.Select(&allItems,
+		"SELECT * FROM files WHERE (path = ? OR path LIKE ?) AND owner = ? AND deleted_at IS NULL AND (is_folder = 1 OR message_id IS NOT NULL)",
+		folderPrefix, folderPrefix+"/%", username)
+	if err != nil {
+		return
+	}
+
+	zw := zip.NewWriter(c.Writer)
+	defer zw.Close()
+
+	getZipPath := func(item database.File) string {
+		itemFullPath := item.Path + "/" + item.Filename
+		if item.Path == "/" {
+			itemFullPath = "/" + item.Filename
+		}
+		parentPrefix := folder.Path
+		if parentPrefix == "/" {
+			return strings.TrimPrefix(itemFullPath, "/")
+		}
+		return strings.TrimPrefix(strings.TrimPrefix(itemFullPath, parentPrefix), "/")
+	}
+
+	for _, item := range allItems {
+		zipPath := getZipPath(item)
+		if item.IsFolder {
+			if !strings.HasSuffix(zipPath, "/") {
+				zipPath += "/"
+			}
+			_, _ = zw.Create(zipPath)
+		} else {
+			header := &zip.FileHeader{
+				Name:   zipPath,
+				Method: zip.Deflate,
+			}
+			header.Modified = item.CreatedAt
+
+			writer, err := zw.CreateHeader(header)
+			if err != nil {
+				continue
+			}
+
+			reader, err := tgclient.GetTelegramFileReader(c.Request.Context(), item, h.cfg)
+			if err != nil {
+				continue
+			}
+
+			_, _ = io.Copy(writer, reader)
+			reader.Close()
+
+			if flusher, ok := c.Writer.(http.Flusher); ok {
+				flusher.Flush()
+			}
+		}
+	}
+}
+
