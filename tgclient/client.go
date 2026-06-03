@@ -58,7 +58,12 @@ var (
 	// botFileWorkers is a bounded channel used as a semaphore to limit concurrent
 	// bot file-processing goroutines. This prevents Telegram flood-wait errors
 	// when a user sends a large album or many files at once.
-	botFileWorkers = make(chan struct{}, 16)
+	// Reduced from 16 to 3 to prevent overwhelming Telegram/log group rate limits.
+	botFileWorkers = make(chan struct{}, 3)
+
+	// botMutexes is a thread-safe map storing a mutex per botToken to serialize
+	// processing of messages sequentially on a per-bot basis.
+	botMutexes sync.Map
 
 	AppConfig *config.Config
 	UserbotCooldownUntil time.Time
@@ -837,6 +842,32 @@ func registerBotUpdateHandlers(dispatcher *tg.UpdateDispatcher, botToken string)
 		msg := u.Message
 		entities := e
 		go func() {
+			// 1. Serialize message processing sequentially on a per-bot basis.
+			val, _ := botMutexes.LoadOrStore(botToken, &sync.Mutex{})
+			mu := val.(*sync.Mutex)
+			mu.Lock()
+			defer mu.Unlock()
+
+			// 2. Check bot rate-limit cooldown state. If rate-limited, wait out the
+			// cooldown period *outside* of the global semaphore slot to keep it free for other bots.
+			BotPoolMu.RLock()
+			var cooldown time.Duration
+			for _, bot := range BotPool {
+				if bot.Token == botToken {
+					if time.Now().Before(bot.CooldownUntil) {
+						cooldown = time.Until(bot.CooldownUntil)
+					}
+					break
+				}
+			}
+			BotPoolMu.RUnlock()
+
+			if cooldown > 0 {
+				log.Printf("[BotPool] Bot %s... is rate-limited. Waiting %v before processing next message.", botToken[:8], cooldown)
+				time.Sleep(cooldown)
+			}
+
+			// 3. Acquire a global worker slot.
 			botFileWorkers <- struct{}{}        // acquire slot
 			defer func() { <-botFileWorkers }() // release slot
 			workCtx := context.Background()
@@ -1092,6 +1123,7 @@ func handleBotNewMessage(ctx context.Context, e tg.Entities, msgClass tg.Message
 		}
 		// If Telegram returns FLOOD_WAIT, respect the wait duration instead of a fixed backoff.
 		if secs, ok := ParseFloodWait(err); ok {
+			MarkBotCooldown(botClient, secs)
 			waitDur := time.Duration(secs+1) * time.Second
 			log.Printf("[BotPool] FLOOD_WAIT %ds while forwarding file — waiting before retry", secs)
 			time.Sleep(waitDur)
@@ -1195,21 +1227,112 @@ func handleBotNewMessage(ctx context.Context, e tg.Entities, msgClass tg.Message
 		return nil
 	}
 
-	// Send English confirmation message back to the Telegram sender via the sub-bot (non-blocking)
+	// Trigger background thumbnail generation
+	if AppConfig != nil {
+		go func(fid int64) {
+			_, _ = RegenerateFileThumbnail(context.Background(), fid, AppConfig)
+		}(fileID)
+	}
+
+	// Queue a debounced confirmation message back to the Telegram sender via the sub-bot
 	cleanRelFolder := strings.TrimPrefix(strings.TrimPrefix(folderPath, "/"+ownerUsername), "/")
 	if cleanRelFolder == "" {
 		cleanRelFolder = "/"
 	}
-	confirmText := fmt.Sprintf("✅ <b>Successfully received file:</b> <code>%s</code>\n📂 <b>Folder:</b> <code>/%s</code>\n☁️ <b>TeleCloud upload completed!</b>", uniqueFilename, cleanRelFolder)
-	confirmMsgOpt := html.String(nil, confirmText)
-	go func() {
-		botSender := message.NewSender(botClient)
-		_, sendErr := botSender.To(fromPeer).Silent().StyledText(context.Background(), confirmMsgOpt)
-		if sendErr != nil {
-			log.Printf("[BotPool] Failed to send confirmation response to user %d: %v", senderUserID, sendErr)
-		}
-	}()
+	queueConfirmation(botClient, fromPeer, botToken, senderUserID, uniqueFilename, cleanRelFolder)
 
 	log.Printf("[BotPool] Successfully received, forwarded, and recorded file %s (%d bytes) in %s belonging to %s as message %d", uniqueFilename, docSize, folderPath, ownerUsername, newMessageID)
 	return nil
+}
+
+// Debounced confirmation structures and logic
+type confirmKey struct {
+	botToken string
+	userID   int64
+}
+
+type pendingConfirm struct {
+	filenames []string
+	folder    string
+	botClient *tg.Client
+	fromPeer  tg.InputPeerClass
+	timer     *time.Timer
+}
+
+var (
+	confirmMu     sync.Mutex
+	confirmations = make(map[confirmKey]*pendingConfirm)
+)
+
+func queueConfirmation(botClient *tg.Client, fromPeer tg.InputPeerClass, botToken string, userID int64, filename string, folder string) {
+	confirmMu.Lock()
+	defer confirmMu.Unlock()
+
+	key := confirmKey{botToken: botToken, userID: userID}
+	pc, ok := confirmations[key]
+	if !ok {
+		pc = &pendingConfirm{
+			botClient: botClient,
+			fromPeer:  fromPeer,
+			folder:    folder,
+		}
+		confirmations[key] = pc
+	}
+
+	pc.filenames = append(pc.filenames, filename)
+	pc.folder = folder
+
+	if pc.timer != nil {
+		pc.timer.Stop()
+	}
+
+	pc.timer = time.AfterFunc(1500*time.Millisecond, func() {
+		sendDebouncedConfirmation(key)
+	})
+}
+
+func sendDebouncedConfirmation(key confirmKey) {
+	confirmMu.Lock()
+	pc, ok := confirmations[key]
+	if !ok {
+		confirmMu.Unlock()
+		return
+	}
+	filenames := pc.filenames
+	folder := pc.folder
+	botClient := pc.botClient
+	fromPeer := pc.fromPeer
+	delete(confirmations, key)
+	confirmMu.Unlock()
+
+	if len(filenames) == 0 {
+		return
+	}
+
+	var confirmText string
+	if len(filenames) == 1 {
+		confirmText = fmt.Sprintf("✅ <b>Successfully received file:</b> <code>%s</code>\n📂 <b>Folder:</b> <code>/%s</code>\n☁️ <b>TeleCloud upload completed!</b>", filenames[0], folder)
+	} else {
+		var sb strings.Builder
+		sb.WriteString(fmt.Sprintf("✅ <b>Successfully received %d files:</b>\n", len(filenames)))
+		
+		maxShow := 15
+		for i, name := range filenames {
+			if i >= maxShow {
+				sb.WriteString(fmt.Sprintf("• <i>and %d more files...</i>\n", len(filenames)-maxShow))
+				break
+			}
+			sb.WriteString(fmt.Sprintf("• <code>%s</code>\n", name))
+		}
+		
+		sb.WriteString(fmt.Sprintf("\n📂 <b>Folder:</b> <code>/%s</code>\n☁️ <b>TeleCloud upload completed!</b>", folder))
+		confirmText = sb.String()
+	}
+
+	confirmMsgOpt := html.String(nil, confirmText)
+	botSender := message.NewSender(botClient)
+	_, sendErr := botSender.To(fromPeer).Silent().StyledText(context.Background(), confirmMsgOpt)
+	if sendErr != nil {
+		log.Printf("[BotPool] Failed to send debounced confirmation response to user %d: %v", key.userID, sendErr)
+	}
 }

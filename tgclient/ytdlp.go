@@ -105,7 +105,31 @@ func GetYTDLPFormats(url string, cfg *config.Config, owner string) (*YTDLPInfo, 
 	cmd := exec.Command(cfg.YTDLPPath, args...)
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
-	cmd.Env = os.Environ()
+
+	// Add ffmpeg and aria2c parent directories to PATH so yt-dlp can locate them
+	var pathDirs []string
+	if cfg.FFMPEGPath != "disabled" && cfg.FFMPEGPath != "disable" && cfg.FFMPEGPath != "" {
+		if absFFMPEG, err := filepath.Abs(cfg.FFMPEGPath); err == nil {
+			pathDirs = append(pathDirs, filepath.Dir(absFFMPEG))
+		}
+	}
+	if cfg.TorrentPath != "disabled" && cfg.TorrentPath != "disable" && cfg.TorrentPath != "" {
+		if absTorrent, err := filepath.Abs(cfg.TorrentPath); err == nil {
+			pathDirs = append(pathDirs, filepath.Dir(absTorrent))
+		}
+	}
+
+	env := os.Environ()
+	if len(pathDirs) > 0 {
+		for i, e := range env {
+			if strings.HasPrefix(strings.ToUpper(e), "PATH=") {
+				sep := string(os.PathListSeparator)
+				env[i] = "PATH=" + strings.Join(pathDirs, sep) + sep + e[5:]
+				break
+			}
+		}
+	}
+	cmd.Env = env
 
 	err := cmd.Run()
 	if err != nil {
@@ -234,6 +258,7 @@ func ProcessYTDLPUpload(ctx context.Context, url, formatID, path, taskID, downlo
 	args := []string{
 		"--newline",
 		"--no-playlist",
+		"--concurrent-fragments", "5",
 		"-o", tempPathPattern,
 	}
 
@@ -276,8 +301,32 @@ func ProcessYTDLPUpload(ctx context.Context, url, formatID, path, taskID, downlo
 	defer cancelTimeout()
 
 	cmd := exec.CommandContext(ytdlpCtx, cfg.YTDLPPath, args...)
-	cmd.Env = os.Environ()
 	setProcessGroup(cmd)
+
+	// Add ffmpeg and aria2c parent directories to PATH so yt-dlp can locate them
+	var pathDirs []string
+	if cfg.FFMPEGPath != "disabled" && cfg.FFMPEGPath != "disable" && cfg.FFMPEGPath != "" {
+		if absFFMPEG, err := filepath.Abs(cfg.FFMPEGPath); err == nil {
+			pathDirs = append(pathDirs, filepath.Dir(absFFMPEG))
+		}
+	}
+	if cfg.TorrentPath != "disabled" && cfg.TorrentPath != "disable" && cfg.TorrentPath != "" {
+		if absTorrent, err := filepath.Abs(cfg.TorrentPath); err == nil {
+			pathDirs = append(pathDirs, filepath.Dir(absTorrent))
+		}
+	}
+
+	env := os.Environ()
+	if len(pathDirs) > 0 {
+		for i, e := range env {
+			if strings.HasPrefix(strings.ToUpper(e), "PATH=") {
+				sep := string(os.PathListSeparator)
+				env[i] = "PATH=" + strings.Join(pathDirs, sep) + sep + e[5:]
+				break
+			}
+		}
+	}
+	cmd.Env = env
 
 	// Capture both stdout and stderr interleaved for real-time progress
 	var stderrBuf strings.Builder
@@ -308,27 +357,68 @@ func ProcessYTDLPUpload(ctx context.Context, url, formatID, path, taskID, downlo
 	}()
 
 	// Progress regex: [download]  10.0% of 100.00MiB at  1.00MiB/s ETA 01:30
-	// Updated to handle both "10%" and "10.0%"
-	progressRegex := regexp.MustCompile(`\[download\]\s+(\d+(?:\.\d+)?)%`)
+	// Updated to handle both "10%" and "10.0%", total size, and download speed
+	progressRegex := regexp.MustCompile(`\[download\]\s+(\d+(?:\.\d+)?)%\s+of\s+~?([^\s]+)(?:\s+at\s+([^\s]+))?`)
+	destRegex := regexp.MustCompile(`\[download\] Destination:\s+(.+)`)
+	alreadyDownloadedRegex := regexp.MustCompile(`\[download\]\s+(.+)\s+has already been downloaded`)
 
+	prefix := "ytdlp_" + taskID + "_"
+	videoTitle := "Video"
 	lastPercent := -1
+	lastTotalSize := int64(0)
+
 	scanner := bufio.NewScanner(pr)
 	for scanner.Scan() {
 		line := scanner.Text()
+
+		if m := destRegex.FindStringSubmatch(line); len(m) > 1 {
+			fname := filepath.Base(m[1])
+			videoTitle = strings.TrimPrefix(fname, prefix)
+		} else if m := alreadyDownloadedRegex.FindStringSubmatch(line); len(m) > 1 {
+			fname := filepath.Base(m[1])
+			videoTitle = strings.TrimPrefix(fname, prefix)
+		}
+
 		matches := progressRegex.FindStringSubmatch(line)
 		if len(matches) > 1 {
 			percent, _ := strconv.ParseFloat(matches[1], 64)
 			p := int(percent)
-			if p != lastPercent {
-				UpdateTask(taskID, "downloading", p, "downloading", owner)
+
+			totalStr := matches[2]
+			totalSizeBytes := parseSpeedToBytes(totalStr)
+			downloadedBytes := int64(float64(totalSizeBytes) * (percent / 100.0))
+
+			speedBytes := int64(0)
+			if len(matches) > 3 && matches[3] != "" {
+				speedStrClean := strings.TrimSuffix(strings.ToLower(matches[3]), "/s")
+				speedBytes = parseSpeedToBytes(speedStrClean)
+			}
+
+			// Disk space check
+			if totalSizeBytes > 0 {
+				if totalSizeBytes >= lastTotalSize {
+					if totalSizeBytes > 1024*1024 && totalSizeBytes != lastTotalSize {
+						_, free, err := utils.GetDiskSpace(cfg.TempDir)
+						if err == nil && uint64(totalSizeBytes) > free {
+							killProcessGroup(cmd)
+							UpdateTask(taskID, "error", 0, "err_insufficient_storage", owner)
+							return
+						}
+					}
+					lastTotalSize = totalSizeBytes
+				}
+			}
+
+			if p != lastPercent || speedBytes > 0 {
+				UpdateTaskWithSpeed(taskID, "downloading", p, "downloading", videoTitle, owner, totalSizeBytes, downloadedBytes, speedBytes)
 				lastPercent = p
 			}
 		} else {
 			// Clean informative messages
 			if strings.HasPrefix(line, "[Merger] Merging formats") {
-				UpdateTask(taskID, "downloading", 100, "ytdlp_merging", owner)
+				UpdateTaskWithSpeed(taskID, "downloading", 100, "ytdlp_merging", videoTitle, owner, lastTotalSize, lastTotalSize, 0)
 			} else if strings.Contains(line, "Adding thumbnail to") || strings.HasPrefix(line, "[EmbedThumbnail]") {
-				UpdateTask(taskID, "downloading", 100, "ytdlp_thumbnail", owner)
+				UpdateTaskWithSpeed(taskID, "downloading", 100, "ytdlp_thumbnail", videoTitle, owner, lastTotalSize, lastTotalSize, 0)
 			}
 		}
 	}
@@ -367,7 +457,6 @@ func ProcessYTDLPUpload(ctx context.Context, url, formatID, path, taskID, downlo
 	}
 
 	var downloadedFile string
-	prefix := "ytdlp_" + taskID + "_"
 
 	// Better selection: skip intermediate files like .part, .ytdl or .fXXX extensions
 	var candidates []string

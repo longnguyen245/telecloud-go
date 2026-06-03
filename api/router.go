@@ -113,6 +113,7 @@ func SetupRouter(cfg *config.Config, contentFS fs.FS, startTG func(cfg *config.C
 	r.GET("/s/:token/file/:id/epub/resource/*path", h.handleGetSharedEpubResource)
 	r.HEAD("/s/:token/file/:id/epub/resource/*path", h.handleGetSharedEpubResource)
 	r.GET("/dl/:token", h.handleGetDirectDownload)
+	r.GET("/api/temp-stream/:token", h.handleTempStreamFile)
 
 	// Protected API group
 	api := r.Group("/api")
@@ -178,6 +179,7 @@ func SetupRouter(cfg *config.Config, contentFS fs.FS, startTG func(cfg *config.C
 		api.POST("/files/:id/share", h.handleShareFile)
 		api.DELETE("/files/:id/share", h.handleRevokeShare)
 		api.GET("/files/:id/thumb", h.handleGetThumb)
+		api.POST("/files/:id/regenerate-thumb", h.handleRegenerateThumb)
 		api.GET("/files/:id/stream", h.handleStreamFile)
 		api.GET("/files/:id/stream/:filename", h.handleStreamFile)
 		api.GET("/files/:id/cbz/list", h.handleGetComicPages)

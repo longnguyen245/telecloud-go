@@ -1,9 +1,11 @@
 package tgclient
 
 import (
+	"container/list"
 	"context"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"net/url"
 	"strings"
@@ -16,9 +18,65 @@ import (
 	"github.com/gotd/td/tg"
 )
 
+// BlockCache implements a thread-safe LRU cache for file chunks.
+type BlockCache struct {
+	mu       sync.Mutex
+	capacity int
+	ll       *list.List
+	cache    map[string]*list.Element
+}
+
+type cacheEntry struct {
+	key   string
+	value []byte
+}
+
+func NewBlockCache(capacity int) *BlockCache {
+	return &BlockCache{
+		capacity: capacity,
+		ll:       list.New(),
+		cache:    make(map[string]*list.Element),
+	}
+}
+
+func (c *BlockCache) Get(key string) ([]byte, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if ele, hit := c.cache[key]; hit {
+		c.ll.MoveToFront(ele)
+		return ele.Value.(*cacheEntry).value, true
+	}
+	return nil, false
+}
+
+func (c *BlockCache) Add(key string, value []byte) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if ele, hit := c.cache[key]; hit {
+		c.ll.MoveToFront(ele)
+		ele.Value.(*cacheEntry).value = value
+		return
+	}
+	ele := c.ll.PushFront(&cacheEntry{key, value})
+	c.cache[key] = ele
+	if c.ll.Len() > c.capacity {
+		c.removeOldest()
+	}
+}
+
+func (c *BlockCache) removeOldest() {
+	ele := c.ll.Back()
+	if ele != nil {
+		c.ll.Remove(ele)
+		kv := ele.Value.(*cacheEntry)
+		delete(c.cache, kv.key)
+	}
+}
+
 var (
-	locationCache = make(map[int]*cachedLocation)
-	cacheMutex    sync.RWMutex
+	locationCache    = make(map[int]*cachedLocation)
+	cacheMutex       sync.RWMutex
+	globalChunkCache = NewBlockCache(128) // 128 MB maximum buffer size
 )
 
 func init() {
@@ -51,6 +109,8 @@ type tgFileReader struct {
 	loc    tg.InputFileLocationClass
 	size   int64
 	offset int64
+	msgID  int
+	cfg    *config.Config
 
 	// Current chunk (served synchronously)
 	chunkData   []byte
@@ -60,6 +120,7 @@ type tgFileReader struct {
 	prefetchChunks map[int64][]byte // offset → prefetched chunk data
 	prefetchMu     sync.Mutex
 	prefetchSem    chan struct{} // capacity 1: ensures only one prefetch goroutine at a time
+	locMu          sync.Mutex    // Protects loc and api updates during file reference refreshes
 }
 
 func (r *tgFileReader) Close() error {
@@ -92,18 +153,35 @@ func (r *tgFileReader) Read(p []byte) (int, error) {
 			r.chunkOffset = chunkStart
 			delete(r.prefetchChunks, chunkStart)
 			r.prefetchMu.Unlock()
+
+			// Cache in global cache for other readers to reuse
+			globalChunkCache.Add(fmt.Sprintf("%d_%d", r.msgID, chunkStart), data)
 		} else {
 			r.prefetchMu.Unlock()
-			// Fallback: synchronous fetch with retries
-			data, err := r.fetchChunk(r.api, chunkStart, chunkSize)
-			if err != nil {
-				return 0, err
+
+			// Try to get the chunk from the global chunk cache
+			cacheKey := fmt.Sprintf("%d_%d", r.msgID, chunkStart)
+			if data, ok := globalChunkCache.Get(cacheKey); ok {
+				if r.offset >= chunkStart+int64(len(data)) {
+					return 0, io.ErrUnexpectedEOF
+				}
+				r.chunkData = data
+				r.chunkOffset = chunkStart
+			} else {
+				// Fallback: synchronous fetch with retries
+				data, err := r.fetchChunk(r.api, chunkStart, chunkSize)
+				if err != nil {
+					return 0, err
+				}
+				if r.offset >= chunkStart+int64(len(data)) {
+					return 0, io.ErrUnexpectedEOF
+				}
+				r.chunkData = data
+				r.chunkOffset = chunkStart
+
+				// Store in global cache
+				globalChunkCache.Add(cacheKey, data)
 			}
-			if r.offset >= chunkStart+int64(len(data)) {
-				return 0, io.ErrUnexpectedEOF
-			}
-			r.chunkData = data
-			r.chunkOffset = chunkStart
 		}
 	}
 
@@ -130,12 +208,18 @@ func (r *tgFileReader) triggerPrefetch(offset int64, limit int64) {
 	}
 
 	r.prefetchMu.Lock()
-	// Already prefetched or being prefetched
+	// Already prefetched or being prefetched locally
 	if _, exists := r.prefetchChunks[offset]; exists {
 		r.prefetchMu.Unlock()
 		return
 	}
 	r.prefetchMu.Unlock()
+
+	// Check if already in global chunk cache
+	cacheKey := fmt.Sprintf("%d_%d", r.msgID, offset)
+	if _, ok := globalChunkCache.Get(cacheKey); ok {
+		return
+	}
 
 	// Non-blocking: if a prefetch is already running, skip
 	select {
@@ -147,12 +231,20 @@ func (r *tgFileReader) triggerPrefetch(offset int64, limit int64) {
 	go func() {
 		defer func() { <-r.prefetchSem }()
 
+		// Double check global cache before network call
+		if _, ok := globalChunkCache.Get(cacheKey); ok {
+			return
+		}
+
 		// Use a different bot than the one used for sync fallback
 		fetchAPI := GetAPI()
 		data, err := r.fetchChunk(fetchAPI, offset, limit)
 		if err != nil {
 			return
 		}
+
+		// Store in global chunk cache
+		globalChunkCache.Add(cacheKey, data)
 
 		r.prefetchMu.Lock()
 		r.prefetchChunks[offset] = data
@@ -161,15 +253,20 @@ func (r *tgFileReader) triggerPrefetch(offset int64, limit int64) {
 }
 
 func (r *tgFileReader) fetchChunk(api *tg.Client, offset int64, limit int64) ([]byte, error) {
+	r.locMu.Lock()
+	loc := r.loc
+	r.locMu.Unlock()
+
 	req := &tg.UploadGetFileRequest{
 		Precise:  true,
-		Location: r.loc,
+		Location: loc,
 		Offset:   offset,
 		Limit:    int(limit),
 	}
 
 	var res tg.UploadFileClass
 	var err error
+	refreshed := false
 	for attempt := 0; attempt < 3; attempt++ {
 		res, err = api.UploadGetFile(r.ctx, req)
 		if err == nil {
@@ -192,6 +289,63 @@ func (r *tgFileReader) fetchChunk(api *tg.Client, offset int64, limit int64) ([]
 			return nil, r.ctx.Err()
 		}
 		errStr := err.Error()
+
+		if strings.Contains(errStr, "FILE_REFERENCE_EXPIRED") || strings.Contains(errStr, "FILEREF_INVALID") {
+			if refreshed {
+				// Already refreshed once in this fetchChunk call, don't loop infinitely
+				continue
+			}
+
+			r.locMu.Lock()
+			// If another thread (e.g. prefetch or main read) has already refreshed the location,
+			// req.Location would be different from the updated r.loc.
+			// In that case, we can just use the new r.loc and retry immediately.
+			if r.loc != req.Location {
+				req.Location = r.loc
+				r.locMu.Unlock()
+				refreshed = true
+				attempt-- // Do not consume a retry attempt
+				log.Printf("[downloader] Another thread refreshed location for msgID %d, retrying with new location...", r.msgID)
+				continue
+			}
+			r.locMu.Unlock()
+
+			log.Printf("[downloader] File reference expired/invalid for msgID %d, re-resolving...", r.msgID)
+
+			// Invalidate local and global cache
+			cacheMutex.Lock()
+			delete(locationCache, r.msgID)
+			cacheMutex.Unlock()
+
+			// Re-resolve
+			newLoc, errResolve := resolveMediaLocation(r.ctx, api, r.msgID, r.cfg)
+			if errResolve != nil && api != Client.API() {
+				newLoc, errResolve = resolveMediaLocation(r.ctx, Client.API(), r.msgID, r.cfg)
+			}
+
+			if errResolve == nil && newLoc != nil {
+				r.locMu.Lock()
+				r.loc = newLoc
+				r.locMu.Unlock()
+
+				cacheMutex.Lock()
+				locationCache[r.msgID] = &cachedLocation{
+					loc:       newLoc,
+					api:       api,
+					expiresAt: time.Now().Add(1 * time.Hour),
+				}
+				cacheMutex.Unlock()
+
+				req.Location = newLoc
+				refreshed = true
+				attempt-- // Do not consume a retry attempt
+				log.Printf("[downloader] Successfully re-resolved location for msgID %d, retrying chunk download...", r.msgID)
+				continue
+			} else {
+				log.Printf("[downloader] Failed to re-resolve location for msgID %d: %v", r.msgID, errResolve)
+			}
+		}
+
 		if strings.Contains(errStr, "FLOOD_WAIT") || strings.Contains(errStr, "TIMEOUT") || strings.Contains(errStr, "RPC_CALL_FAIL") {
 			waitDuration := time.Duration(attempt+1) * 2 * time.Second
 			if strings.Contains(errStr, "FLOOD_WAIT_") {
@@ -328,6 +482,114 @@ func GetTelegramFileReader(ctx context.Context, file database.File, cfg *config.
 	return getSinglePartReader(ctx, *file.MessageID, file.Size, cfg)
 }
 
+func resolveMediaLocation(ctx context.Context, targetApi *tg.Client, msgID int, cfg *config.Config) (tg.InputFileLocationClass, error) {
+	peer, err := resolveLogGroup(ctx, targetApi, cfg.LogGroupID)
+	if err != nil {
+		return nil, err
+	}
+
+	var msgs tg.MessageClassArray
+	if channel, ok := peer.(*tg.InputPeerChannel); ok {
+		res, err := targetApi.ChannelsGetMessages(ctx, &tg.ChannelsGetMessagesRequest{
+			Channel: &tg.InputChannel{
+				ChannelID:  channel.ChannelID,
+				AccessHash: channel.AccessHash,
+			},
+			ID: []tg.InputMessageClass{&tg.InputMessageID{ID: msgID}},
+		})
+		if err != nil {
+			return nil, err
+		}
+		switch m := res.(type) {
+		case *tg.MessagesMessages:
+			msgs = m.Messages
+		case *tg.MessagesMessagesSlice:
+			msgs = m.Messages
+		case *tg.MessagesChannelMessages:
+			msgs = m.Messages
+		}
+	} else {
+		res, err := targetApi.MessagesGetMessages(ctx, []tg.InputMessageClass{&tg.InputMessageID{ID: msgID}})
+		if err != nil {
+			return nil, err
+		}
+		switch m := res.(type) {
+		case *tg.MessagesMessages:
+			msgs = m.Messages
+		case *tg.MessagesMessagesSlice:
+			msgs = m.Messages
+		case *tg.MessagesChannelMessages:
+			msgs = m.Messages
+		}
+	}
+
+	if len(msgs) == 0 {
+		return nil, fmt.Errorf("message not found")
+	}
+
+	msg, ok := msgs[0].(*tg.Message)
+	if !ok || msg.Media == nil {
+		return nil, fmt.Errorf("message has no media")
+	}
+
+	if docMedia, ok := msg.Media.(*tg.MessageMediaDocument); ok {
+		doc, ok := docMedia.Document.(*tg.Document)
+		if !ok {
+			return nil, fmt.Errorf("document is empty")
+		}
+		return doc.AsInputDocumentFileLocation(), nil
+	}
+
+	if photoMedia, ok := msg.Media.(*tg.MessageMediaPhoto); ok {
+		photo, ok := photoMedia.Photo.(*tg.Photo)
+		if !ok {
+			return nil, fmt.Errorf("photo is empty")
+		}
+		// Find the best photo size available (largest w/h/size)
+		var bestSizeClass tg.PhotoSizeClass
+		var maxArea int
+		for _, sz := range photo.Sizes {
+			switch s := sz.(type) {
+			case *tg.PhotoSize:
+				area := s.W * s.H
+				if area > maxArea {
+					maxArea = area
+					bestSizeClass = sz
+				}
+			case *tg.PhotoSizeProgressive:
+				area := s.W * s.H
+				if area > maxArea {
+					maxArea = area
+					bestSizeClass = sz
+				}
+			case *tg.PhotoCachedSize:
+				area := s.W * s.H
+				if area > maxArea {
+					maxArea = area
+					bestSizeClass = sz
+				}
+			}
+		}
+
+		if bestSizeClass == nil && len(photo.Sizes) > 0 {
+			bestSizeClass = photo.Sizes[len(photo.Sizes)-1]
+		}
+
+		if bestSizeClass == nil {
+			return nil, fmt.Errorf("no valid photo sizes found")
+		}
+
+		return &tg.InputPhotoFileLocation{
+			ID:            photo.ID,
+			AccessHash:    photo.AccessHash,
+			FileReference: photo.FileReference,
+			ThumbSize:     bestSizeClass.GetType(),
+		}, nil
+	}
+
+	return nil, fmt.Errorf("media type not supported for download: %T", msg.Media)
+}
+
 var getSinglePartReader = func(ctx context.Context, msgID int, size int64, cfg *config.Config) (io.ReadSeekCloser, error) {
 	ctx, cancel := context.WithCancel(ctx)
 
@@ -343,6 +605,8 @@ var getSinglePartReader = func(ctx context.Context, msgID int, size int64, cfg *
 			api:            cached.api,
 			loc:            cached.loc,
 			size:           size,
+			msgID:          msgID,
+			cfg:            cfg,
 			prefetchChunks: make(map[int64][]byte),
 			prefetchSem:    make(chan struct{}, 1),
 		}, nil
@@ -350,113 +614,7 @@ var getSinglePartReader = func(ctx context.Context, msgID int, size int64, cfg *
 
 	// Helper function to resolve media from a specific API client
 	resolve := func(targetApi *tg.Client) (tg.InputFileLocationClass, error) {
-		peer, err := resolveLogGroup(ctx, targetApi, cfg.LogGroupID)
-		if err != nil {
-			return nil, err
-		}
-
-		var msgs tg.MessageClassArray
-		if channel, ok := peer.(*tg.InputPeerChannel); ok {
-			res, err := targetApi.ChannelsGetMessages(ctx, &tg.ChannelsGetMessagesRequest{
-				Channel: &tg.InputChannel{
-					ChannelID:  channel.ChannelID,
-					AccessHash: channel.AccessHash,
-				},
-				ID: []tg.InputMessageClass{&tg.InputMessageID{ID: msgID}},
-			})
-			if err != nil {
-				return nil, err
-			}
-			switch m := res.(type) {
-			case *tg.MessagesMessages:
-				msgs = m.Messages
-			case *tg.MessagesMessagesSlice:
-				msgs = m.Messages
-			case *tg.MessagesChannelMessages:
-				msgs = m.Messages
-			}
-		} else {
-			res, err := targetApi.MessagesGetMessages(ctx, []tg.InputMessageClass{&tg.InputMessageID{ID: msgID}})
-			if err != nil {
-				return nil, err
-			}
-			switch m := res.(type) {
-			case *tg.MessagesMessages:
-				msgs = m.Messages
-			case *tg.MessagesMessagesSlice:
-				msgs = m.Messages
-			case *tg.MessagesChannelMessages:
-				msgs = m.Messages
-			}
-		}
-
-		if len(msgs) == 0 {
-			return nil, fmt.Errorf("message not found")
-		}
-
-		msg, ok := msgs[0].(*tg.Message)
-		if !ok || msg.Media == nil {
-			// This often happens if the bot is not an admin in a group and privacy mode is on,
-			// or if the message ID is invalid for this session.
-			return nil, fmt.Errorf("message has no media")
-		}
-
-		if docMedia, ok := msg.Media.(*tg.MessageMediaDocument); ok {
-			doc, ok := docMedia.Document.(*tg.Document)
-			if !ok {
-				return nil, fmt.Errorf("document is empty")
-			}
-			return doc.AsInputDocumentFileLocation(), nil
-		}
-
-		if photoMedia, ok := msg.Media.(*tg.MessageMediaPhoto); ok {
-			photo, ok := photoMedia.Photo.(*tg.Photo)
-			if !ok {
-				return nil, fmt.Errorf("photo is empty")
-			}
-			// Find the best photo size available (largest w/h/size)
-			var bestSizeClass tg.PhotoSizeClass
-			var maxArea int
-			for _, sz := range photo.Sizes {
-				switch s := sz.(type) {
-				case *tg.PhotoSize:
-					area := s.W * s.H
-					if area > maxArea {
-						maxArea = area
-						bestSizeClass = sz
-					}
-				case *tg.PhotoSizeProgressive:
-					area := s.W * s.H
-					if area > maxArea {
-						maxArea = area
-						bestSizeClass = sz
-					}
-				case *tg.PhotoCachedSize:
-					area := s.W * s.H
-					if area > maxArea {
-						maxArea = area
-						bestSizeClass = sz
-					}
-				}
-			}
-
-			if bestSizeClass == nil && len(photo.Sizes) > 0 {
-				bestSizeClass = photo.Sizes[len(photo.Sizes)-1]
-			}
-
-			if bestSizeClass == nil {
-				return nil, fmt.Errorf("no valid photo sizes found")
-			}
-
-			return &tg.InputPhotoFileLocation{
-				ID:            photo.ID,
-				AccessHash:    photo.AccessHash,
-				FileReference: photo.FileReference,
-				ThumbSize:     bestSizeClass.GetType(),
-			}, nil
-		}
-
-		return nil, fmt.Errorf("media type not supported for download: %T", msg.Media)
+		return resolveMediaLocation(ctx, targetApi, msgID, cfg)
 	}
 
 	api := GetAPI()
@@ -496,6 +654,8 @@ var getSinglePartReader = func(ctx context.Context, msgID int, size int64, cfg *
 		api:            api,
 		loc:            loc,
 		size:           size,
+		msgID:          msgID,
+		cfg:            cfg,
 		prefetchChunks: make(map[int64][]byte),
 		prefetchSem:    make(chan struct{}, 1),
 	}

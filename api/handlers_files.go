@@ -654,6 +654,9 @@ func (h *Handler) handlePostPaste(c *gin.Context) {
 		return
 	}
 
+	unlock := database.AcquireFileInsertLock(username, req.Destination)
+	defer unlock()
+
 	tx, err := database.DB.Beginx()
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to start transaction"})
@@ -1832,4 +1835,69 @@ func (h *Handler) handleDownloadFolder(c *gin.Context) {
 		}
 	}
 }
+
+func (h *Handler) handleTempStreamFile(c *gin.Context) {
+	token := c.Param("token")
+	val, ok := tgclient.TempStreamTokens.Load(token)
+	if !ok {
+		c.AbortWithStatus(http.StatusNotFound)
+		return
+	}
+	info, ok := val.(tgclient.TempStreamInfo)
+	if !ok {
+		c.AbortWithStatus(http.StatusNotFound)
+		return
+	}
+
+	var item database.File
+	if err := database.RODB.Get(&item, "SELECT * FROM files WHERE id = ?", info.FileID); err != nil {
+		c.AbortWithStatus(http.StatusNotFound)
+		return
+	}
+
+	if item.Owner != info.Username {
+		c.AbortWithStatus(http.StatusForbidden)
+		return
+	}
+
+	if err := tgclient.ServeTelegramFile(c.Request, c.Writer, item, h.cfg); err != nil {
+		log.Printf("[TempStream] ServeTelegramFile error: %v", err)
+	}
+}
+
+func (h *Handler) handleRegenerateThumb(c *gin.Context) {
+	id, err := strconv.Atoi(c.Param("id"))
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid id"})
+		return
+	}
+
+	username := c.GetString("username")
+	var item database.File
+	if err := database.RODB.Get(&item, "SELECT id, is_folder FROM files WHERE id = ? AND owner = ?", id, username); err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "file not found"})
+		return
+	}
+
+	if item.IsFolder {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "folders do not support covers"})
+		return
+	}
+
+	newPath, err := tgclient.RegenerateFileThumbnail(c.Request.Context(), int64(id), h.cfg)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	hasThumb := false
+	if newPath != nil {
+		if _, errStat := os.Stat(*newPath); errStat == nil {
+			hasThumb = true
+		}
+	}
+
+	c.JSON(http.StatusOK, gin.H{"status": "ok", "has_thumb": hasThumb})
+}
+
 

@@ -576,6 +576,24 @@ func (h *Handler) handleDeleteUser(c *gin.Context) {
 		return
 	}
 
+	if _, err = tx.Exec("DELETE FROM user_settings WHERE username = ?", username); err != nil {
+		tx.Rollback()
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to delete user settings"})
+		return
+	}
+
+	if _, err = tx.Exec("DELETE FROM upload_chunks WHERE task_id IN (SELECT id FROM upload_tasks WHERE owner = ?)", username); err != nil {
+		tx.Rollback()
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to delete user upload chunks"})
+		return
+	}
+
+	if _, err = tx.Exec("DELETE FROM upload_tasks WHERE owner = ?", username); err != nil {
+		tx.Rollback()
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to delete user upload tasks"})
+		return
+	}
+
 	if err := tx.Commit(); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to commit transaction"})
 		return

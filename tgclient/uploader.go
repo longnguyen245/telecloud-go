@@ -1240,14 +1240,15 @@ func ProcessRemoteUpload(ctx context.Context, url, path, taskID string, cfg *con
 		}
 	}
 
-	// Note: Remote uploads usually don't have a local file for thumbnail generation
-	// unless we download it first. Since this is a streaming upload, we skip local thumb for now.
-	// But we signal done so the UI refreshes.
+	// Trigger background thumbnail generation for remote upload
+	go func(fid int64) {
+		_, _ = RegenerateFileThumbnail(context.Background(), fid, cfg)
+	}(fileID)
+
 	UpdateTaskWithFileID(taskID, "done", 100, "", fileID, uniqueFilename, owner)
 	success = true
 }
 
-// ProcessCompleteUploadSync is the synchronous version for the Upload API.
 // ProcessCompleteUploadSync is the synchronous version for the Upload API.
 func ProcessCompleteUploadSync(ctx context.Context, filePath, filename, path, mimeType, taskID string, cfg *config.Config, overwrite bool, owner string) (fileID int64, finalName string, err error) {
 	if taskID != "" {
