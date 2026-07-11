@@ -55,6 +55,17 @@ Mã nguồn frontend nằm ở repo: [**dabeecao/telecloud-frontend**](https://g
 2. Tạo tệp mới (VD: `fr.json`) và dịch từ `en.json`.
 3. Thêm ngôn ngữ vào `availableLangs` trong `static/js/common.js`.
 4. Gửi Pull Request vào repository frontend.
+### 3. Lưu ý về phát triển Cơ sở dữ liệu (SQL) & Khóa mã hóa
+
+#### Khóa mã hóa (`master.key`):
+- Để tránh xung đột đường dẫn lưu trữ khóa `master.key` khi thư mục `data` được tạo sau lúc ứng dụng khởi động, toàn bộ mã nguồn sử dụng hàm `utils.GetMasterKeyFilePath()` để xác định vị trí tệp khóa chủ.
+- Hàm này tự động phát hiện tệp khóa tồn tại sẵn tại các đường dẫn: `/app/data/master.key`, `data/master.key` hoặc gần file SQLite DB `DATABASE_PATH`.
+- Trong phát triển, luôn gọi hàm `utils.GetMasterKeyFilePath()` thay vì tự nội suy đường dẫn để tránh lỗi mất khóa hay sinh khóa mới khi cấu hình MySQL/Postgres.
+
+#### Quy tắc tương thích cơ sở dữ liệu:
+- Khi viết các câu truy vấn SQL liên quan tới kiểu dữ liệu logic (`BOOLEAN`), ví dụ trường `is_folder` hoặc `force_password_change`:
+  - **KHÔNG ĐƯỢC** gán hoặc so sánh trực tiếp với số nguyên (`1` hoặc `0`).
+  - **BẮT BUỘC** sử dụng các từ khóa SQL tiêu chuẩn là `TRUE` và `FALSE` để đảm bảo tương thích tốt nhất trên cả SQLite, MySQL và đặc biệt là cơ chế so khớp kiểu dữ liệu nghiêm ngặt của PostgreSQL.
 
 ---
 
@@ -88,3 +99,16 @@ Frontend source: [**dabeecao/telecloud-frontend**](https://github.com/dabeecao/t
 1. Edit JSON files in `static/locales/`.
 2. Add the language to `availableLangs` in `static/js/common.js`.
 3. Submit a Pull Request.
+
+
+### 3. Database Development & Master Key Guidelines
+
+#### Encryption Key (`master.key`):
+- To prevent key path conflicts when the `data` directory is created dynamically during runtime, always use `utils.GetMasterKeyFilePath()` to resolve the persistent key path.
+- The path resolver automatically checks standard locations (`/app/data/master.key`, `data/master.key`, or relative to SQLite `DATABASE_PATH`) before choosing a fallback write path.
+- Never write ad-hoc file checks for `master.key`; use the unified helper instead to prevent auto-regeneration bugs under MySQL/PostgreSQL.
+
+#### Database Compatibility Guidelines:
+- When writing SQL queries that filter or write to `BOOLEAN` columns (such as `is_folder` or `force_password_change`):
+  - **DO NOT** use integer literals (`1` or `0`).
+  - **ALWAYS** use standard SQL boolean literals `TRUE` and `FALSE` to satisfy PostgreSQL's strict type verification while keeping full compatibility with SQLite and MySQL.

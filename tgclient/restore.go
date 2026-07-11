@@ -10,6 +10,7 @@ import (
 	"strings"
 	"telecloud/config"
 	"telecloud/database"
+	"telecloud/utils"
 )
 
 // PerformRestore restores database and configurations from an uploaded ZIP or DB file.
@@ -203,15 +204,5 @@ func PerformRestore(cfg *config.Config, uploadedPath string) error {
 }
 
 func resolveKeyFilePath() string {
-	if _, err := os.Stat("/app/data"); err == nil {
-		return "/app/data/master.key"
-	}
-	if _, err := os.Stat("data"); err == nil {
-		return "data/master.key"
-	}
-	dbPath := strings.TrimSpace(os.Getenv("DATABASE_PATH"))
-	if dbPath != "" {
-		return filepath.Join(filepath.Dir(dbPath), "master.key")
-	}
-	return "data/master.key"
+	return utils.GetMasterKeyFilePath()
 }

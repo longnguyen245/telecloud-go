@@ -66,10 +66,10 @@ func (h *Handler) handleGetIndex(c *gin.Context) {
 
 	var userStorageUsed int64
 	if isAdmin {
-		database.RODB.Get(&userStorageUsed, "SELECT COALESCE(SUM(size), 0) FROM files WHERE is_folder = 0 AND message_id IS NOT NULL AND deleted_at IS NULL")
+		database.RODB.Get(&userStorageUsed, "SELECT COALESCE(SUM(size), 0) FROM files WHERE is_folder = FALSE AND message_id IS NOT NULL AND deleted_at IS NULL")
 	} else {
 		prefix := "/" + sessionUsername
-		database.RODB.Get(&userStorageUsed, "SELECT COALESCE(SUM(size), 0) FROM files WHERE (path = ? OR path LIKE ?) AND is_folder = 0 AND message_id IS NOT NULL AND deleted_at IS NULL", prefix, prefix+"/%")
+		database.RODB.Get(&userStorageUsed, "SELECT COALESCE(SUM(size), 0) FROM files WHERE (path = ? OR path LIKE ?) AND is_folder = FALSE AND message_id IS NOT NULL AND deleted_at IS NULL", prefix, prefix+"/%")
 	}
 
 	// S3 for the current session user
@@ -152,11 +152,11 @@ func (h *Handler) handleGetFiles(c *gin.Context) {
 	}
 
 	var files []database.File
-	query := "SELECT * FROM files WHERE path = ? AND owner = ? AND deleted_at IS NULL AND (is_folder = 1 OR message_id IS NOT NULL) ORDER BY is_folder DESC, id DESC"
+	query := "SELECT * FROM files WHERE path = ? AND owner = ? AND deleted_at IS NULL AND (is_folder = TRUE OR message_id IS NOT NULL) ORDER BY is_folder DESC, id DESC"
 	args := []interface{}{dbPath, username}
 	if isAdmin {
 		if dbPath == "/" {
-			query = "SELECT * FROM files WHERE path = ? AND deleted_at IS NULL AND (is_folder = 1 OR message_id IS NOT NULL) ORDER BY is_folder DESC, id DESC"
+			query = "SELECT * FROM files WHERE path = ? AND deleted_at IS NULL AND (is_folder = TRUE OR message_id IS NOT NULL) ORDER BY is_folder DESC, id DESC"
 			args = []interface{}{dbPath}
 		} else {
 			parts := strings.Split(strings.TrimPrefix(dbPath, "/"), "/")
@@ -168,7 +168,7 @@ func (h *Handler) handleGetFiles(c *gin.Context) {
 			if isChild > 0 {
 				effectiveOwner = rootFolder
 			}
-			query = "SELECT * FROM files WHERE path = ? AND owner = ? AND deleted_at IS NULL AND (is_folder = 1 OR message_id IS NOT NULL) ORDER BY is_folder DESC, id DESC"
+			query = "SELECT * FROM files WHERE path = ? AND owner = ? AND deleted_at IS NULL AND (is_folder = TRUE OR message_id IS NOT NULL) ORDER BY is_folder DESC, id DESC"
 			args = []interface{}{dbPath, effectiveOwner}
 		}
 	}
@@ -253,10 +253,10 @@ func (h *Handler) handleGetFiles(c *gin.Context) {
 	}
 	var storageUsed int64
 	if isAdmin {
-		database.RODB.Get(&storageUsed, "SELECT COALESCE(SUM(size), 0) FROM files WHERE is_folder = 0 AND message_id IS NOT NULL")
+		database.RODB.Get(&storageUsed, "SELECT COALESCE(SUM(size), 0) FROM files WHERE is_folder = FALSE AND message_id IS NOT NULL AND owner = ?", username)
 	} else {
 		prefix := "/" + username
-		database.RODB.Get(&storageUsed, "SELECT COALESCE(SUM(size), 0) FROM files WHERE (path = ? OR path LIKE ?) AND is_folder = 0 AND message_id IS NOT NULL", prefix, prefix+"/%")
+		database.RODB.Get(&storageUsed, "SELECT COALESCE(SUM(size), 0) FROM files WHERE (path = ? OR path LIKE ?) AND is_folder = FALSE AND message_id IS NOT NULL", prefix, prefix+"/%")
 	}
 
 	c.JSON(http.StatusOK, gin.H{
@@ -287,7 +287,7 @@ func (h *Handler) handlePostFolders(c *gin.Context) {
 	}
 
 	uniqueName := database.GetUniqueFilename(database.RODB, dbPath, name, true, 0, username)
-	_, err := database.DB.Exec("INSERT INTO files (filename, path, is_folder, owner) VALUES (?, ?, 1, ?)", uniqueName, dbPath, username)
+	_, err := database.DB.Exec("INSERT INTO files (filename, path, is_folder, owner) VALUES (?, ?, TRUE, ?)", uniqueName, dbPath, username)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
@@ -505,7 +505,7 @@ func (h *Handler) handlePostRemoteUpload(c *gin.Context) {
 
 	if dbPath != "/" {
 		var folder database.File
-		err = database.RODB.Get(&folder, "SELECT is_folder FROM files WHERE path = ? AND filename = ? AND is_folder = 1 AND owner = ?", filepath.Dir(dbPath), filepath.Base(dbPath), username)
+		err = database.RODB.Get(&folder, "SELECT is_folder FROM files WHERE path = ? AND filename = ? AND is_folder = TRUE AND owner = ?", filepath.Dir(dbPath), filepath.Base(dbPath), username)
 		if err != nil {
 			c.JSON(http.StatusNotFound, gin.H{"error": "folder_not_found"})
 			return
@@ -722,7 +722,7 @@ func (h *Handler) handlePostPaste(c *gin.Context) {
 			}
 		case "copy":
 			if item.IsFolder {
-				_, err = tx.Exec("INSERT INTO files (filename, path, is_folder, owner) VALUES (?, ?, 1, ?)", uniqueName, req.Destination, username)
+				_, err = tx.Exec("INSERT INTO files (filename, path, is_folder, owner) VALUES (?, ?, TRUE, ?)", uniqueName, req.Destination, username)
 				if err != nil {
 					c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 					return
@@ -767,7 +767,7 @@ func (h *Handler) handlePostPaste(c *gin.Context) {
 					continue
 				}
 				newFileID, err := database.InsertAndGetID(tx,
-					"INSERT INTO files (message_id, filename, path, size, mime_type, is_folder, thumb_path, owner) VALUES (?, ?, ?, ?, ?, 0, ?, ?)",
+					"INSERT INTO files (message_id, filename, path, size, mime_type, is_folder, thumb_path, owner) VALUES (?, ?, ?, ?, ?, FALSE, ?, ?)",
 					item.MessageID, uniqueName, req.Destination, item.Size, item.MimeType, item.ThumbPath, username)
 				if err != nil {
 					c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
@@ -1334,7 +1334,7 @@ func (h *Handler) handlePostCheckExists(c *gin.Context) {
 	existing := make([]string, 0)
 	for _, fn := range filenames {
 		var count int
-		err := database.RODB.Get(&count, "SELECT COUNT(*) FROM files WHERE path = ? AND filename = ? AND is_folder = 0 AND owner = ?", dbPath, fn, username)
+		err := database.RODB.Get(&count, "SELECT COUNT(*) FROM files WHERE path = ? AND filename = ? AND is_folder = FALSE AND owner = ?", dbPath, fn, username)
 		if err == nil && count > 0 {
 			existing = append(existing, fn)
 		}
@@ -1680,7 +1680,7 @@ func (h *Handler) publicShareItem(origin string, fileID int64, shareMode, dbPath
 			}
 			parentPath := filepath.Dir(dbPath)
 			parentName := filepath.Base(dbPath)
-			err := database.RODB.Get(&parent, "SELECT id FROM files WHERE path = ? AND filename = ? AND is_folder = 1 AND owner = ?", parentPath, parentName, username)
+			err := database.RODB.Get(&parent, "SELECT id FROM files WHERE path = ? AND filename = ? AND is_folder = TRUE AND owner = ?", parentPath, parentName, username)
 			if err == nil {
 				targetID = parent.ID
 			} else {
@@ -1781,7 +1781,7 @@ func (h *Handler) handleDownloadFolder(c *gin.Context) {
 
 	var allItems []database.File
 	err = database.RODB.Select(&allItems,
-		"SELECT * FROM files WHERE (path = ? OR path LIKE ?) AND owner = ? AND deleted_at IS NULL AND (is_folder = 1 OR message_id IS NOT NULL)",
+		"SELECT * FROM files WHERE (path = ? OR path LIKE ?) AND owner = ? AND deleted_at IS NULL AND (is_folder = TRUE OR message_id IS NOT NULL)",
 		folderPrefix, folderPrefix+"/%", username)
 	if err != nil {
 		return

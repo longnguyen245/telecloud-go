@@ -27,10 +27,66 @@ const (
 )
 
 var (
-	masterKey     []byte
-	masterKeyOnce sync.Once
-	masterKeyErr  error
+	masterKey       []byte
+	masterKeyOnce   sync.Once
+	masterKeyErr    error
+	resolvedKeyPath string
+	resolvedPathMu  sync.RWMutex
 )
+
+// GetMasterKeyFilePath returns the resolved file path for the master.key file.
+// It prioritizes checking if the file already exists in standard locations.
+// If the file does not exist, it determines the best directory to create it.
+func GetMasterKeyFilePath() string {
+	resolvedPathMu.RLock()
+	if resolvedKeyPath != "" {
+		path := resolvedKeyPath
+		resolvedPathMu.RUnlock()
+		return path
+	}
+	resolvedPathMu.RUnlock()
+
+	resolvedPathMu.Lock()
+	defer resolvedPathMu.Unlock()
+	if resolvedKeyPath != "" {
+		return resolvedKeyPath
+	}
+
+	// 1. Check if the file already exists at /app/data/master.key
+	if _, err := os.Stat("/app/data/master.key"); err == nil {
+		resolvedKeyPath = "/app/data/master.key"
+		return resolvedKeyPath
+	}
+
+	// 2. Check if the file already exists at data/master.key
+	if _, err := os.Stat(filepath.Join("data", "master.key")); err == nil {
+		resolvedKeyPath = filepath.Join("data", "master.key")
+		return resolvedKeyPath
+	}
+
+	// 3. Check if the file already exists near the database path
+	dbPath := strings.TrimSpace(os.Getenv("DATABASE_PATH"))
+	if dbPath != "" {
+		dbKeyPath := filepath.Join(filepath.Dir(dbPath), "master.key")
+		if _, err := os.Stat(dbKeyPath); err == nil {
+			resolvedKeyPath = dbKeyPath
+			return resolvedKeyPath
+		}
+	}
+
+	// 4. File does not exist anywhere yet (first run). Determine where to write it.
+	if _, err := os.Stat("/app/data"); err == nil {
+		resolvedKeyPath = "/app/data/master.key"
+	} else if _, err := os.Stat("data"); err == nil {
+		resolvedKeyPath = filepath.Join("data", "master.key")
+	} else if dbPath != "" {
+		resolvedKeyPath = filepath.Join(filepath.Dir(dbPath), "master.key")
+	} else {
+		resolvedKeyPath = filepath.Join("data", "master.key")
+	}
+
+	return resolvedKeyPath
+}
 
 // LoadMasterKey reads the TELECLOUD_MASTER_KEY env var and caches the decoded bytes.
 // If the env var is not set, it attempts to load a cached key from a master.key file
@@ -42,19 +98,7 @@ func LoadMasterKey() ([]byte, error) {
 		raw := strings.TrimSpace(os.Getenv(masterKeyEnv))
 		if raw == "" {
 			// No env variable set. Determine the best location for a persistent key file.
-			keyFile := ""
-			if _, err := os.Stat("/app/data"); err == nil {
-				keyFile = "/app/data/master.key"
-			} else if _, err := os.Stat("data"); err == nil {
-				keyFile = filepath.Join("data", "master.key")
-			} else {
-				dbPath := strings.TrimSpace(os.Getenv("DATABASE_PATH"))
-				if dbPath != "" {
-					keyFile = filepath.Join(filepath.Dir(dbPath), "master.key")
-				} else {
-					keyFile = filepath.Join("data", "master.key")
-				}
-			}
+			keyFile := GetMasterKeyFilePath()
 
 			// Try to read key from the file
 			if data, err := os.ReadFile(keyFile); err == nil {

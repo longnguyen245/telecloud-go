@@ -69,6 +69,12 @@ func csrfMiddleware() gin.HandlerFunc {
 			return
 		}
 
+		// Bypass CSRF for Basic Auth / API requests (since they use Authorization header, not ambient cookie session)
+		if c.GetHeader("Authorization") != "" {
+			c.Next()
+			return
+		}
+
 		cookieToken, err := c.Cookie(csrfCookieName)
 		if err != nil || cookieToken == "" {
 			c.AbortWithStatusJSON(http.StatusForbidden, gin.H{"error": "csrf token missing"})

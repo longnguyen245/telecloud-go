@@ -51,7 +51,7 @@ func TestHandleDeleteUserCleanup(t *testing.T) {
 	}
 
 	// 3. Insert file (root user folder)
-	_, err = database.DB.Exec("INSERT INTO files (filename, path, is_folder, owner) VALUES (?, '/', 1, ?)", username, username)
+	_, err = database.DB.Exec("INSERT INTO files (filename, path, is_folder, owner) VALUES (?, '/', TRUE, ?)", username, username)
 	if err != nil {
 		t.Fatalf("failed to insert folder file: %v", err)
 	}

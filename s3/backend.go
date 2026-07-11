@@ -91,7 +91,7 @@ func (b *TelecloudBackend) ListBucket(name string, prefix *gofakes3.Prefix, page
 			fullSearchPath = path.Join(searchDir, searchBase)
 		}
 
-		query := "SELECT id, path, filename, size, is_folder, created_at FROM files WHERE path = ? AND owner = ? AND deleted_at IS NULL AND (is_folder = 1 OR message_id IS NOT NULL)"
+		query := "SELECT id, path, filename, size, is_folder, created_at FROM files WHERE path = ? AND owner = ? AND deleted_at IS NULL AND (is_folder = TRUE OR message_id IS NOT NULL)"
 		args := []interface{}{fullSearchPath, b.username}
 
 		if isPartialFile {
@@ -113,11 +113,11 @@ func (b *TelecloudBackend) ListBucket(name string, prefix *gofakes3.Prefix, page
 			likePattern = "/%"
 		}
 
-		query := "SELECT id, path, filename, size, is_folder, created_at FROM files WHERE (path = ? OR path LIKE ?) AND owner = ? AND deleted_at IS NULL AND (is_folder = 1 OR message_id IS NOT NULL)"
+		query := "SELECT id, path, filename, size, is_folder, created_at FROM files WHERE (path = ? OR path LIKE ?) AND owner = ? AND deleted_at IS NULL AND (is_folder = TRUE OR message_id IS NOT NULL)"
 		args := []interface{}{fullSearchPath, likePattern, b.username}
 
 		if isPartialFile {
-			query = "SELECT id, path, filename, size, is_folder, created_at FROM files WHERE ((path = ? AND filename LIKE ?) OR (path LIKE ?)) AND owner = ? AND deleted_at IS NULL AND (is_folder = 1 OR message_id IS NOT NULL)"
+			query = "SELECT id, path, filename, size, is_folder, created_at FROM files WHERE ((path = ? AND filename LIKE ?) OR (path LIKE ?)) AND owner = ? AND deleted_at IS NULL AND (is_folder = TRUE OR message_id IS NOT NULL)"
 			args = []interface{}{searchDir, searchBase + "%", path.Join(searchDir, searchBase) + "/%", b.username}
 		}
 

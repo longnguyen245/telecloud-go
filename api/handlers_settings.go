@@ -55,7 +55,7 @@ func (h *Handler) handlePostPassword(c *gin.Context) {
 	if isAdmin {
 		database.SetSetting("admin_password_hash", string(hashedPassword))
 	} else {
-		database.DB.Exec("UPDATE child_accounts SET password_hash = ?, force_password_change = 0 WHERE username = ?", string(hashedPassword), username)
+		database.DB.Exec("UPDATE child_accounts SET password_hash = ?, force_password_change = FALSE WHERE username = ?", string(hashedPassword), username)
 	}
 
 	currentToken, _ := c.Cookie("session_token")
@@ -417,8 +417,8 @@ func (h *Handler) handleGetUsers(c *gin.Context) {
 		var fileCount int
 		var totalSize int64
 		owner := users[i].Username
-		database.RODB.Get(&fileCount, "SELECT COUNT(*) FROM files WHERE owner = ? AND is_folder = 0", owner)
-		database.RODB.Get(&totalSize, "SELECT COALESCE(SUM(size), 0) FROM files WHERE owner = ? AND is_folder = 0", owner)
+		database.RODB.Get(&fileCount, "SELECT COUNT(*) FROM files WHERE owner = ? AND is_folder = FALSE", owner)
+		database.RODB.Get(&totalSize, "SELECT COALESCE(SUM(size), 0) FROM files WHERE owner = ? AND is_folder = FALSE", owner)
 		users[i].FileCount = fileCount
 		users[i].TotalSize = totalSize
 	}
@@ -467,9 +467,9 @@ func (h *Handler) handlePostUser(c *gin.Context) {
 	defer tx.Rollback()
 
 	var folderCount int
-	folderQuery := "SELECT COUNT(*) FROM files WHERE path = '/' AND filename = ? COLLATE NOCASE AND is_folder = 1"
+	folderQuery := "SELECT COUNT(*) FROM files WHERE path = '/' AND filename = ? COLLATE NOCASE AND is_folder = TRUE"
 	if database.IsMySQL() || database.IsPostgres() {
-		folderQuery = "SELECT COUNT(*) FROM files WHERE path = '/' AND LOWER(filename) = LOWER(?) AND is_folder = 1"
+		folderQuery = "SELECT COUNT(*) FROM files WHERE path = '/' AND LOWER(filename) = LOWER(?) AND is_folder = TRUE"
 	}
 	err = tx.Get(&folderCount, folderQuery, username)
 	if err != nil {
@@ -496,13 +496,13 @@ func (h *Handler) handlePostUser(c *gin.Context) {
 		return
 	}
 
-	_, err = tx.Exec("INSERT INTO child_accounts (username, password_hash, force_password_change) VALUES (?, ?, 1)", username, string(hashedPassword))
+	_, err = tx.Exec("INSERT INTO child_accounts (username, password_hash, force_password_change) VALUES (?, ?, TRUE)", username, string(hashedPassword))
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to create user record"})
 		return
 	}
 
-	_, err = tx.Exec("INSERT INTO files (filename, path, is_folder, owner) VALUES (?, '/', 1, ?)", username, username)
+	_, err = tx.Exec("INSERT INTO files (filename, path, is_folder, owner) VALUES (?, '/', TRUE, ?)", username, username)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to create folder"})
 		return
@@ -534,7 +534,7 @@ func (h *Handler) handleDeleteUser(c *gin.Context) {
 	newFolderName := fmt.Sprintf("deleted_%s_%s", username, timestamp)
 	adminUsername := c.GetString("username")
 
-	_, err = tx.Exec("UPDATE files SET filename = ?, owner = ? WHERE path = '/' AND filename = ? AND is_folder = 1 AND owner = ?", newFolderName, adminUsername, username, username)
+	_, err = tx.Exec("UPDATE files SET filename = ?, owner = ? WHERE path = '/' AND filename = ? AND is_folder = TRUE AND owner = ?", newFolderName, adminUsername, username, username)
 	if err != nil {
 		tx.Rollback()
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to rename user folder"})
@@ -616,7 +616,7 @@ func (h *Handler) handlePostUserResetPass(c *gin.Context) {
 		return
 	}
 
-	_, err = database.DB.Exec("UPDATE child_accounts SET password_hash = ?, force_password_change = 1 WHERE username = ?", string(hashedPassword), username)
+	_, err = database.DB.Exec("UPDATE child_accounts SET password_hash = ?, force_password_change = TRUE WHERE username = ?", string(hashedPassword), username)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to reset password"})
 		return
