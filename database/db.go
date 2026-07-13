@@ -820,6 +820,14 @@ func migratePostgres() error {
 		ON files (path, filename, owner)
 		WHERE deleted_at IS NULL
 	`)
+	if _, err := DB.Exec(`
+		ALTER TABLE files
+		ALTER COLUMN is_folder DROP DEFAULT,
+		ALTER COLUMN is_folder TYPE BOOLEAN USING (is_folder = 1),
+		ALTER COLUMN is_folder SET DEFAULT FALSE
+	`); err != nil {
+		return err
+	}
 	return err
 }
 
