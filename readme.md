@@ -11,6 +11,9 @@
 
 **TeleCloud** là một dự án sử dụng dung lượng lưu trữ của Telegram để lưu trữ và quản lý tệp. Được viết lại hoàn toàn bằng Golang, đem lại hiệu năng xuất sắc và sử dụng bộ nhớ cực thấp.
 
+> [!TIP]
+> **Phiên bản Client Mobile:** Dự án hiện đã có phiên bản client dành cho điện thoại di động, [tải và xem hướng dẫn tại đây](./docs/MobileClient.md).
+
 > [!IMPORTANT]
 > **Thay đổi từ phiên bản 3.7.0**
 > Kể từ v3.7.0, **App ID, API Hash** và **Bot Token (Bot Pool)** không còn cấu hình trong file `.env` nữa — tất cả được quản lý trực tiếp trong **Giao diện Cài đặt** của ứng dụng:
@@ -95,6 +98,7 @@ Download [**`auto-install-en.bat`**](https://raw.githubusercontent.com/dabeecao/
 *   [🛠️ **Hướng dẫn cài đặt**](./docs/Installation.md) (Binary, Windows, Linux...)
 *   [⚙️ **Hướng dẫn cấu hình**](./docs/Configuration.md) (.env, Nginx Proxy...)
 *   [🐳 **Triển khai với Docker**](./docs/Docker.md) (Docker Run, Compose)
+*   [📱 **Client di động**](./docs/MobileClient.md) (Hướng dẫn cài đặt & Kết nối)
 *   [🔌 **Tài liệu API**](./docs/API.md) (Hướng dẫn Upload API)
 *   [🔐 **Chính sách bảo mật**](./docs/Security.md) (Mã hóa, Hardening & Cảnh báo)
 *   [🛠️ **Phát triển & Bản dịch**](./docs/Development.md) (Build từ nguồn, Đóng góp)

@@ -11,6 +11,9 @@
 
 **TeleCloud** is a project that allows you to use Telegram’s nearly unlimited storage capacity to store and manage files. Completely rewritten in Golang for excellent performance and low memory usage.
 
+> [!TIP]
+> **Mobile Client Version:** The project now has a mobile client available, [download & see guide here](./docs/MobileClient.md).
+
 > [!IMPORTANT]
 > **Changed since version 3.7.0**
 > Starting from v3.7.0, **App ID & API Hash** and **Bot Tokens (Bot Pool)** are no longer configured in the `.env` file — everything is managed directly inside the **application's Settings UI**:
@@ -95,6 +98,7 @@ For configuration details and alternative installation methods, please refer to 
 *   [🛠️ **Installation Guide**](./docs/Installation.md) (Binary, Windows, Linux...)
 *   [⚙️ **Configuration Guide**](./docs/Configuration.md) (.env, Nginx Proxy...)
 *   [🐳 **Docker Deployment**](./docs/Docker.md) (Docker Run, Compose)
+*   [📱 **Mobile Client Guide**](./docs/MobileClient.md) (Installation & Connection)
 *   [🔌 **API Documentation**](./docs/API.md) (Upload API Guide)
 *   [🔐 **Security Policy**](./docs/Security.md) (Encryption, Hardening & Warnings)
 *   [🛠️ **Development & Localization**](./docs/Development.md) (Build from source, Contribute)
