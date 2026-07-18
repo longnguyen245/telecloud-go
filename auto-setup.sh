@@ -487,6 +487,22 @@ cloudflared_setup() {
         cloudflared tunnel create "$TUNNEL_NAME" > "$BASE_DIR/tunnel.txt" || return 1
     fi
 
+    # QUAN TRỌNG: Service telecloud-tunnel chạy với DynamicUser=true + ProtectHome=true
+    # nên KHÔNG thể đọc được file credentials (~/.cloudflared/<id>.json), gây lỗi 1033.
+    # Copy file credentials vào $BASE_DIR (thư mục được whitelist qua ReadWritePaths) để service đọc được.
+    if [ ! -f "$BASE_DIR/tunnel-credentials.json" ]; then
+        # Không chỉ dựa vào $HOME: cloudflared tự dò nơi có cert.pem để ghi credentials,
+        # trên Linux script chạy bằng root nên luôn ưu tiên kiểm tra /root/.cloudflared/ trước.
+        CRED_SRC=$(find /root/.cloudflared "$HOME/.cloudflared" -maxdepth 1 -name '*.json' ! -name 'cert.json' -printf '%T@ %p\n' 2>/dev/null | sort -rn | head -n 1 | cut -d' ' -f2-)
+        if [ -z "$CRED_SRC" ]; then
+            echo "[!] LỖI: Không tìm thấy file credentials của tunnel trong /root/.cloudflared/ hoặc $HOME/.cloudflared/"
+            return 1
+        fi
+        cp "$CRED_SRC" "$BASE_DIR/tunnel-credentials.json"
+        chmod 600 "$BASE_DIR/tunnel-credentials.json"
+        echo "[+] Đã sao chép credentials tunnel vào $BASE_DIR/tunnel-credentials.json"
+    fi
+
     read -p "Nhập tên miền của bạn (VD: telecloud.domain.com) hoặc Enter để bỏ qua: " MY_DOMAIN
     if [ ! -z "$MY_DOMAIN" ]; then
         echo "[+] Đang trỏ DNS (Force)..."
@@ -570,6 +586,29 @@ EOF
         # Dịch vụ Cloudflare Tunnel (nếu có)
         if [ -f "$BASE_DIR/tunnel.txt" ]; then
             local TUNNEL_NAME=$(cat "$BASE_DIR/tunnel-name.txt" 2>/dev/null || echo "telecloud-tunnel")
+
+            # Tạo user hệ thống riêng cho cloudflared thay vì DynamicUser (tránh phải để
+            # credentials world-readable). User này không có shell, không home.
+            if ! id -u cf-tunnel &>/dev/null; then
+                if command -v useradd &>/dev/null; then
+                    useradd --system --no-create-home --shell /usr/sbin/nologin cf-tunnel 2>/dev/null \
+                        || useradd -r -s /usr/sbin/nologin cf-tunnel 2>/dev/null || true
+                elif command -v adduser &>/dev/null; then
+                    adduser -S -D -H -s /sbin/nologin cf-tunnel 2>/dev/null || true
+                fi
+            fi
+            if id -u cf-tunnel &>/dev/null; then
+                chown cf-tunnel:cf-tunnel "$BASE_DIR/tunnel-credentials.json" 2>/dev/null || true
+                chmod 600 "$BASE_DIR/tunnel-credentials.json" 2>/dev/null || true
+                CF_SVC_USER="User=cf-tunnel
+Group=cf-tunnel"
+            else
+                # Fallback: không tạo được user riêng -> giữ DynamicUser nhưng cảnh báo rõ
+                echo "[!] CẢNH BÁO: Không tạo được user 'cf-tunnel', dùng DynamicUser (file credentials sẽ world-readable)."
+                chmod 644 "$BASE_DIR/tunnel-credentials.json" 2>/dev/null || true
+                CF_SVC_USER="DynamicUser=true"
+            fi
+
             cat > /etc/systemd/system/telecloud-tunnel.service <<EOF
 [Unit]
 Description=Telecloud Cloudflared Tunnel
@@ -577,8 +616,8 @@ After=network.target
 
 [Service]
 Type=simple
-DynamicUser=true
-ExecStart=$(command -v cloudflared) tunnel run --url http://localhost:$APP_PORT $TUNNEL_NAME
+$CF_SVC_USER
+ExecStart=$(command -v cloudflared) tunnel --credentials-file $BASE_DIR/tunnel-credentials.json run --url http://localhost:$APP_PORT $TUNNEL_NAME
 Restart=always
 RestartSec=3
 
@@ -589,6 +628,7 @@ ProtectHome=true
 PrivateTmp=true
 RestrictSUIDSGID=true
 LockPersonality=true
+ReadWritePaths=$BASE_DIR
 
 [Install]
 WantedBy=multi-user.target
@@ -1068,6 +1108,21 @@ manage_tunnel() {
                 cloudflared tunnel create "$TUNNEL_NAME" > "$BASE_DIR/tunnel.txt"
             fi
 
+            # Sao chép credentials vào $BASE_DIR (service systemd chạy sandbox DynamicUser+ProtectHome
+            # nên không đọc được ~/.cloudflared/*.json trực tiếp -> đây là nguyên nhân gây lỗi 1033)
+            if [ "$OS_TYPE" == "linux" ] && [ ! -f "$BASE_DIR/tunnel-credentials.json" ]; then
+                # Không chỉ dựa vào $HOME: cloudflared tự dò nơi có cert.pem để ghi credentials,
+                # trên Linux script chạy bằng root nên luôn ưu tiên kiểm tra /root/.cloudflared/ trước.
+                CRED_SRC=$(find /root/.cloudflared "$HOME/.cloudflared" -maxdepth 1 -name '*.json' ! -name 'cert.json' -printf '%T@ %p\n' 2>/dev/null | sort -rn | head -n 1 | cut -d' ' -f2-)
+                if [ -n "$CRED_SRC" ]; then
+                    cp "$CRED_SRC" "$BASE_DIR/tunnel-credentials.json"
+                    chmod 600 "$BASE_DIR/tunnel-credentials.json"
+                    echo "[+] Đã sao chép credentials tunnel vào $BASE_DIR/tunnel-credentials.json"
+                else
+                    echo "[!] CẢNH BÁO: Không tìm thấy file credentials, tunnel có thể không kết nối được (lỗi 1033)."
+                fi
+            fi
+
             read -p "Nhập tên miền muốn trỏ (VD: telecloud.domain.com): " NEW_DOMAIN
             if [ ! -z "$NEW_DOMAIN" ]; then
                 cloudflared tunnel route dns -f "$TUNNEL_NAME" "$NEW_DOMAIN"
@@ -1077,6 +1132,61 @@ manage_tunnel() {
                 else
                     echo "❌ Lỗi khi trỏ DNS."
                 fi
+            fi
+
+            # Tạo (hoặc cập nhật) service telecloud-tunnel nếu chưa có — trường hợp tunnel được
+            # thêm SAU khi cài đặt lần đầu thì trước đây service này không bao giờ được tạo ra.
+            if [ "$OS_TYPE" == "linux" ] && command -v systemctl &>/dev/null; then
+                APP_PORT=$(grep "^PORT=" "$BASE_DIR/.env" 2>/dev/null | cut -d'=' -f2)
+                APP_PORT=${APP_PORT:-8091}
+
+                # Dùng user hệ thống riêng thay vì DynamicUser để không phải để credentials world-readable
+                if ! id -u cf-tunnel &>/dev/null; then
+                    if command -v useradd &>/dev/null; then
+                        useradd --system --no-create-home --shell /usr/sbin/nologin cf-tunnel 2>/dev/null \
+                            || useradd -r -s /usr/sbin/nologin cf-tunnel 2>/dev/null || true
+                    elif command -v adduser &>/dev/null; then
+                        adduser -S -D -H -s /sbin/nologin cf-tunnel 2>/dev/null || true
+                    fi
+                fi
+                if id -u cf-tunnel &>/dev/null; then
+                    chown cf-tunnel:cf-tunnel "$BASE_DIR/tunnel-credentials.json" 2>/dev/null || true
+                    chmod 600 "$BASE_DIR/tunnel-credentials.json" 2>/dev/null || true
+                    CF_SVC_USER="User=cf-tunnel
+Group=cf-tunnel"
+                else
+                    echo "[!] CẢNH BÁO: Không tạo được user 'cf-tunnel', dùng DynamicUser (file credentials sẽ world-readable)."
+                    chmod 644 "$BASE_DIR/tunnel-credentials.json" 2>/dev/null || true
+                    CF_SVC_USER="DynamicUser=true"
+                fi
+
+                cat > /etc/systemd/system/telecloud-tunnel.service <<EOF2
+[Unit]
+Description=Telecloud Cloudflared Tunnel
+After=network.target
+
+[Service]
+Type=simple
+$CF_SVC_USER
+ExecStart=$(command -v cloudflared) tunnel --credentials-file $BASE_DIR/tunnel-credentials.json run --url http://localhost:$APP_PORT $TUNNEL_NAME
+Restart=always
+RestartSec=3
+
+# Hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+RestrictSUIDSGID=true
+LockPersonality=true
+ReadWritePaths=$BASE_DIR
+
+[Install]
+WantedBy=multi-user.target
+EOF2
+                systemctl daemon-reload
+                systemctl enable --now telecloud-tunnel
+                echo "✅ Đã tạo/cập nhật service telecloud-tunnel và khởi động."
             fi
             ;;
         2)
@@ -1096,6 +1206,7 @@ manage_tunnel() {
             rm -f "$BASE_DIR/tunnel.txt"
             rm -f "$BASE_DIR/domain.txt"
             rm -f "$BASE_DIR/tunnel-name.txt"
+            rm -f "$BASE_DIR/tunnel-credentials.json"
             echo "✅ Đã xoá Tunnel."
             echo "📢 Hãy xoá bản ghi DNS cũ tại dash.cloudflare.com nếu không dùng nữa!"
             ;;
@@ -1362,6 +1473,11 @@ uninstall() {
             rm -f /etc/systemd/system/telecloud.service 2>/dev/null || true
             rm -f /etc/systemd/system/telecloud-tunnel.service 2>/dev/null || true
             systemctl daemon-reload 2>/dev/null || true
+
+            if id -u cf-tunnel &>/dev/null; then
+                echo "[+] Đang xóa user hệ thống 'cf-tunnel'..."
+                userdel cf-tunnel 2>/dev/null || deluser cf-tunnel 2>/dev/null || true
+            fi
         fi
         
         echo "[+] Đang xóa thư mục ứng dụng: $BASE_DIR"

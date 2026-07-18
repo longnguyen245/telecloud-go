@@ -49,7 +49,7 @@
 * 📂 **Hỗ trợ WebDAV**: Gắn TeleCloud thành ổ đĩa mạng trên máy tính (Windows, macOS, Linux).
 * 🪣 **Tương thích S3 API**: Cung cấp giao diện API tương thích S3 (sử dụng gofakes3) giúp kết nối với các ứng dụng bên thứ ba (Rclone, Cyberduck, Infuse, v.v.), hỗ trợ xác thực chữ ký bảo mật SigV4/SigV2 và Range requests để stream video.
 * 🔌 **Upload API**: Cho phép upload file từ xa qua HTTP API để tích hợp vào script hoặc CI/CD.
-* 📥 **Tải từ URL & Media**: Hỗ trợ tải tệp từ URL và Video/Nhạc (YouTube, TikTok, Facebook...) bằng **yt-dlp** ngay trong giao diện.
+* 📥 **Tải từ URL, Media & Telegram (`t.me`)**: Hỗ trợ tải tệp từ URL và Video/Nhạc (YouTube, TikTok, Facebook...) bằng **yt-dlp**; đặc biệt hỗ trợ tự động giải quyết và **tải trực tiếp tệp bị hạn chế tải về** từ các liên kết Telegram (`t.me` hoặc `tg://`) nhờ tài khoản Userbot tích hợp.
 * ⚡ **Tải trong nền**: Hỗ trợ tải tệp từ URL trong nền, không cần treo trình duyệt, có thông báo tiến trình real-time.
 * 🧲 **Tải Torrent**: Hỗ trợ tải Torrent và Magnet link trực tiếp về Telegram thông qua **aria2c**.
 * 👥 **Đa người dùng**: Hỗ trợ tạo tài khoản con với không gian lưu trữ riêng biệt (Virtual Path).

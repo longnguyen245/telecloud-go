@@ -10,8 +10,10 @@ import (
 	"mime"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 
 	"sync"
@@ -170,6 +172,7 @@ type UploadStatus struct {
 	OldSize          int64 `json:"size,omitempty"`
 	OldUploadedBytes int64 `json:"uploaded_bytes,omitempty"`
 
+	Buffered      bool `json:"-"`
 	startTime     time.Time
 	lastBroadcast time.Time
 }
@@ -322,9 +325,44 @@ func UpdateTaskWithFile(taskID string, status string, percent int, msg string, f
 		phase = "server_upload"
 	}
 
-	progress := float64(percent)
+	isBuffered := false
+	if exists {
+		if status == "downloading" {
+			existing.Buffered = true
+		}
+		isBuffered = existing.Buffered
+	} else {
+		if status == "downloading" {
+			isBuffered = true
+		}
+	}
+
+	displayPercent := percent
+	if isBuffered {
+		switch status {
+		case "downloading":
+			displayPercent = percent / 2
+		case "telegram":
+			displayPercent = 50 + (percent / 2)
+		case "done":
+			displayPercent = 100
+		}
+	}
+
+	progress := float64(displayPercent)
 	if fs > 0 {
-		progress = (float64(fu) / float64(fs)) * 100
+		if isBuffered {
+			switch status {
+			case "downloading":
+				progress = (float64(fu) / float64(fs)) * 50
+			case "telegram":
+				progress = 50 + (float64(fu) / float64(fs)) * 50
+			case "done":
+				progress = 100
+			}
+		} else {
+			progress = (float64(fu) / float64(fs)) * 100
+		}
 	}
 
 	// Fix #2: update the existing struct in-place to avoid allocating a new
@@ -332,7 +370,7 @@ func UpdateTaskWithFile(taskID string, status string, percent int, msg string, f
 	if exists {
 		existing.Status = status
 		existing.Phase = phase
-		existing.Percent = percent
+		existing.Percent = displayPercent
 		existing.Progress = progress
 		existing.Message = msg
 		existing.Filename = finalFilename
@@ -353,7 +391,7 @@ func UpdateTaskWithFile(taskID string, status string, percent int, msg string, f
 		existing = &UploadStatus{
 			Status:           status,
 			Phase:            phase,
-			Percent:          percent,
+			Percent:          displayPercent,
 			Progress:         progress,
 			Message:          msg,
 			Filename:         finalFilename,
@@ -364,6 +402,7 @@ func UpdateTaskWithFile(taskID string, status string, percent int, msg string, f
 			OldUploadedBytes: fu,
 			Speed:            speed,
 			ETA:              eta,
+			Buffered:         isBuffered,
 			startTime:        st,
 		}
 		UploadTasks[taskID] = existing
@@ -373,7 +412,7 @@ func UpdateTaskWithFile(taskID string, status string, percent int, msg string, f
 	isTerminal := status == "done" || status == "error" || status == "cancelled"
 	if isTerminal || time.Since(existing.lastBroadcast) > 500*time.Millisecond {
 		existing.lastBroadcast = time.Now()
-		ws.BroadcastTaskUpdate(finalOwner, taskID, status, percent, msg, existing.Filename, fs, fu, speed, eta)
+		ws.BroadcastTaskUpdate(finalOwner, taskID, status, displayPercent, msg, existing.Filename, fs, fu, speed, eta)
 	}
 
 	// Auto-cleanup: remove task from memory once terminal.
@@ -990,7 +1029,7 @@ func ProcessRemoteUpload(ctx context.Context, url, path, taskID string, cfg *con
 		// Handover to ProcessCompleteUpload asynchronously
 		go func() {
 			defer os.Remove(tempFilePath)
-			ProcessCompleteUpload(ctx, tempFilePath, filename, path, mimeType, taskID, cfg, overwrite, owner)
+			ProcessCompleteUpload(context.Background(), tempFilePath, filename, path, mimeType, taskID, cfg, overwrite, owner)
 		}()
 		return
 	}
@@ -1878,4 +1917,512 @@ func ProcessRemoteUploadSync(ctx context.Context, url, path, taskID string, cfg 
 
 	success = true
 	return fileID, uniqueFilename, nil
+}
+
+func ParseTelegramLink(link string) (username string, channelID int64, msgID int, err error) {
+	if !strings.HasPrefix(link, "http://") && !strings.HasPrefix(link, "https://") && !strings.HasPrefix(link, "tg://") {
+		link = "https://" + link
+	}
+
+	u, err := url.Parse(link)
+	if err != nil {
+		return "", 0, 0, err
+	}
+
+	if u.Scheme == "tg" {
+		switch u.Host {
+		case "resolve":
+			username = u.Query().Get("domain")
+			postStr := u.Query().Get("post")
+			msgID, _ = strconv.Atoi(postStr)
+			if username != "" && msgID > 0 {
+				return username, 0, msgID, nil
+			}
+		case "privatepost":
+			channelStr := u.Query().Get("channel")
+			postStr := u.Query().Get("post")
+			channelID, _ = strconv.ParseInt(channelStr, 10, 64)
+			msgID, _ = strconv.Atoi(postStr)
+			if channelID > 0 && msgID > 0 {
+				return "", channelID, msgID, nil
+			}
+		}
+		return "", 0, 0, fmt.Errorf("unsupported tg link scheme")
+	}
+
+	host := strings.ToLower(u.Host)
+	if host != "t.me" && host != "telegram.me" && host != "telegram.dog" {
+		return "", 0, 0, fmt.Errorf("unsupported telegram host")
+	}
+
+	pathStr := strings.TrimPrefix(u.Path, "/")
+	parts := strings.Split(pathStr, "/")
+	if len(parts) >= 3 && parts[0] == "c" {
+		channelID, err = strconv.ParseInt(parts[1], 10, 64)
+		if err != nil {
+			return "", 0, 0, fmt.Errorf("invalid channel ID in path: %w", err)
+		}
+		msgID, err = strconv.Atoi(parts[2])
+		if err != nil {
+			return "", 0, 0, fmt.Errorf("invalid message ID in path: %w", err)
+		}
+		return "", channelID, msgID, nil
+	}
+
+	if len(parts) >= 2 {
+		username = parts[0]
+		msgID, err = strconv.Atoi(parts[1])
+		if err != nil {
+			return "", 0, 0, fmt.Errorf("invalid message ID in path: %w", err)
+		}
+		return username, 0, msgID, nil
+	}
+
+	return "", 0, 0, fmt.Errorf("unrecognized telegram link format")
+}
+
+func ResolveTelegramPeer(ctx context.Context, api *tg.Client, username string, channelID int64) (tg.InputPeerClass, error) {
+	if username != "" {
+		res, err := api.ContactsResolveUsername(ctx, &tg.ContactsResolveUsernameRequest{Username: username})
+		if err != nil {
+			return nil, fmt.Errorf("resolve username failed: %w", err)
+		}
+		
+		switch p := res.Peer.(type) {
+		case *tg.PeerChannel:
+			var accessHash int64
+			for _, chat := range res.Chats {
+				if ch, ok := chat.(*tg.Channel); ok && ch.ID == p.ChannelID {
+					accessHash = ch.AccessHash
+					break
+				}
+			}
+			return &tg.InputPeerChannel{ChannelID: p.ChannelID, AccessHash: accessHash}, nil
+		case *tg.PeerChat:
+			return &tg.InputPeerChat{ChatID: p.ChatID}, nil
+		case *tg.PeerUser:
+			var accessHash int64
+			for _, u := range res.Users {
+				if usr, ok := u.(*tg.User); ok && usr.ID == p.UserID {
+					accessHash = usr.AccessHash
+					break
+				}
+			}
+			return &tg.InputPeerUser{UserID: p.UserID, AccessHash: accessHash}, nil
+		default:
+			return nil, fmt.Errorf("unsupported peer type in resolved username")
+		}
+	}
+
+	// For private channel: channelID
+	// Try obtaining the channel access hash via ChannelsGetChannels
+	res, err := api.ChannelsGetChannels(ctx, []tg.InputChannelClass{
+		&tg.InputChannel{ChannelID: channelID},
+	})
+	if err != nil {
+		return nil, fmt.Errorf("get channel failed (must be a member of the private channel/group): %w", err)
+	}
+
+	chats := res.GetChats()
+	if len(chats) > 0 {
+		if c, ok := chats[0].(*tg.Channel); ok {
+			return &tg.InputPeerChannel{
+				ChannelID:  c.ID,
+				AccessHash: c.AccessHash,
+			}, nil
+		}
+	}
+
+	return nil, fmt.Errorf("private channel ID %d not found in userbot session chats", channelID)
+}
+
+func FetchTelegramMessage(ctx context.Context, api *tg.Client, peer tg.InputPeerClass, msgID int) (*tg.Message, error) {
+	var msgs tg.MessageClassArray
+	if channel, ok := peer.(*tg.InputPeerChannel); ok {
+		res, err := api.ChannelsGetMessages(ctx, &tg.ChannelsGetMessagesRequest{
+			Channel: &tg.InputChannel{
+				ChannelID:  channel.ChannelID,
+				AccessHash: channel.AccessHash,
+			},
+			ID: []tg.InputMessageClass{&tg.InputMessageID{ID: msgID}},
+		})
+		if err != nil {
+			return nil, fmt.Errorf("channels.getMessages failed: %w", err)
+		}
+		
+		switch m := res.(type) {
+		case *tg.MessagesMessages:
+			msgs = m.Messages
+		case *tg.MessagesMessagesSlice:
+			msgs = m.Messages
+		case *tg.MessagesChannelMessages:
+			msgs = m.Messages
+		}
+	} else {
+		res, err := api.MessagesGetMessages(ctx, []tg.InputMessageClass{&tg.InputMessageID{ID: msgID}})
+		if err != nil {
+			return nil, fmt.Errorf("messages.getMessages failed: %w", err)
+		}
+		
+		switch m := res.(type) {
+		case *tg.MessagesMessages:
+			msgs = m.Messages
+		case *tg.MessagesMessagesSlice:
+			msgs = m.Messages
+		case *tg.MessagesChannelMessages:
+			msgs = m.Messages
+		}
+	}
+
+	if len(msgs) == 0 {
+		return nil, fmt.Errorf("message not found")
+	}
+
+	msg, ok := msgs[0].(*tg.Message)
+	if !ok {
+		return nil, fmt.Errorf("message is empty or service message")
+	}
+
+	return msg, nil
+}
+
+type TelegramMediaInfo struct {
+	Location tg.InputFileLocationClass
+	Filename string
+	Size     int64
+	MimeType string
+}
+
+func ExtractTelegramMediaInfo(msg *tg.Message) (*TelegramMediaInfo, error) {
+	if msg.Media == nil {
+		return nil, fmt.Errorf("message has no media")
+	}
+
+	switch m := msg.Media.(type) {
+	case *tg.MessageMediaDocument:
+		doc, ok := m.Document.(*tg.Document)
+		if !ok {
+			return nil, fmt.Errorf("document media is empty")
+		}
+		
+		filename := "file"
+		for _, attr := range doc.Attributes {
+			if fAttr, ok := attr.(*tg.DocumentAttributeFilename); ok {
+				filename = fAttr.FileName
+				break
+			}
+		}
+
+		mimeType := doc.MimeType
+		if mimeType == "" {
+			mimeType = "application/octet-stream"
+		}
+
+		return &TelegramMediaInfo{
+			Location: doc.AsInputDocumentFileLocation(),
+			Filename: filename,
+			Size:     doc.Size,
+			MimeType: mimeType,
+		}, nil
+
+	case *tg.MessageMediaPhoto:
+		photo, ok := m.Photo.(*tg.Photo)
+		if !ok {
+			return nil, fmt.Errorf("photo media is empty")
+		}
+
+		// Find the best photo size available (largest w/h/size)
+		var bestSizeClass tg.PhotoSizeClass
+		var maxArea int
+		var bestSize int64
+		for _, sz := range photo.Sizes {
+			switch s := sz.(type) {
+			case *tg.PhotoSize:
+				area := s.W * s.H
+				if area > maxArea {
+					maxArea = area
+					bestSizeClass = sz
+					bestSize = int64(s.Size)
+				}
+			case *tg.PhotoSizeProgressive:
+				area := s.W * s.H
+				if area > maxArea {
+					maxArea = area
+					bestSizeClass = sz
+					if len(s.Sizes) > 0 {
+						bestSize = int64(s.Sizes[len(s.Sizes)-1])
+					} else {
+						bestSize = 1
+					}
+				}
+			case *tg.PhotoCachedSize:
+				area := s.W * s.H
+				if area > maxArea {
+					maxArea = area
+					bestSizeClass = sz
+					bestSize = int64(len(s.Bytes))
+				}
+			}
+		}
+
+		if bestSizeClass == nil && len(photo.Sizes) > 0 {
+			bestSizeClass = photo.Sizes[len(photo.Sizes)-1]
+		}
+
+		if bestSizeClass == nil {
+			return nil, fmt.Errorf("no valid photo sizes found")
+		}
+
+		// Extract InputPhotoFileLocation from the best size class
+		var fileLocation tg.InputFileLocationClass
+		switch s := bestSizeClass.(type) {
+		case *tg.PhotoSize:
+			fileLocation = &tg.InputPhotoFileLocation{
+				ID:            photo.ID,
+				AccessHash:    photo.AccessHash,
+				FileReference: photo.FileReference,
+				ThumbSize:     s.Type,
+			}
+		case *tg.PhotoSizeProgressive:
+			fileLocation = &tg.InputPhotoFileLocation{
+				ID:            photo.ID,
+				AccessHash:    photo.AccessHash,
+				FileReference: photo.FileReference,
+				ThumbSize:     s.Type,
+			}
+		case *tg.PhotoCachedSize:
+			fileLocation = &tg.InputPhotoFileLocation{
+				ID:            photo.ID,
+				AccessHash:    photo.AccessHash,
+				FileReference: photo.FileReference,
+				ThumbSize:     s.Type,
+			}
+		}
+
+		if fileLocation == nil {
+			return nil, fmt.Errorf("failed to determine photo file location")
+		}
+
+		ts := time.Unix(int64(photo.Date), 0).UTC().Format("20060102_150405")
+		filename := "photo_" + ts + ".jpg"
+
+		return &TelegramMediaInfo{
+			Location: fileLocation,
+			Filename: filename,
+			Size:     bestSize,
+			MimeType: "image/jpeg",
+		}, nil
+
+	default:
+		return nil, fmt.Errorf("unsupported media type")
+	}
+}
+
+func downloadTelegramFileToFile(ctx context.Context, api *tg.Client, loc tg.InputFileLocationClass, fileSize int64, tempFile *os.File, updateProgress func(downloaded int64, statusMsg string)) error {
+	const chunkSize = int64(1024 * 1024) // 1 MB chunks
+	var offset int64 = 0
+
+	for offset < fileSize {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
+
+		// Always request exactly chunkSize (1 MB) to satisfy Telegram's requirement that
+		// the limit must be a multiple of 4 KB. Telegram will naturally truncate the
+		// response bytes to the remaining file size if we request beyond the end of the file.
+		limit := chunkSize
+
+		req := &tg.UploadGetFileRequest{
+			Precise:  true,
+			Location: loc,
+			Offset:   offset,
+			Limit:    int(limit),
+		}
+
+		var res tg.UploadFileClass
+		var err error
+		for attempt := 0; attempt < 3; attempt++ {
+			if updateProgress != nil {
+				if attempt > 0 {
+					updateProgress(offset, fmt.Sprintf("retry_attempt|attempt=%d,total=3", attempt+1))
+				} else {
+					updateProgress(offset, "downloading_to_buffer")
+				}
+			}
+
+			// Wrap request with a 30-second timeout to prevent indefinite hanging on network loss
+			chunkCtx, chunkCancel := context.WithTimeout(ctx, 30*time.Second)
+			res, err = api.UploadGetFile(chunkCtx, req)
+			chunkCancel()
+
+			if err == nil {
+				break
+			}
+			
+			// Extract wait time from FLOOD_WAIT if possible
+			errStr := err.Error()
+			if strings.Contains(errStr, "FLOOD_WAIT") {
+				waitSec := 2
+				parts := strings.Split(errStr, "_")
+				if len(parts) > 1 {
+					if sec, errSec := strconv.Atoi(parts[len(parts)-1]); errSec == nil {
+						waitSec = sec
+					}
+				}
+				
+				if updateProgress != nil {
+					updateProgress(offset, fmt.Sprintf("flood_wait_retry_in|seconds=%d", waitSec))
+				}
+
+				select {
+				case <-time.After(time.Duration(waitSec) * time.Second):
+				case <-ctx.Done():
+					return ctx.Err()
+				}
+				continue
+			}
+
+			select {
+			case <-time.After(time.Duration(attempt+1) * time.Second):
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		}
+		if err != nil {
+			return fmt.Errorf("telegram_get_file_failed: %w", err)
+		}
+
+		var bytes []byte
+		switch f := res.(type) {
+		case *tg.UploadFile:
+			bytes = f.Bytes
+		default:
+			return fmt.Errorf("unexpected upload file class type")
+		}
+
+		if len(bytes) == 0 {
+			break
+		}
+
+		_, err = tempFile.Write(bytes)
+		if err != nil {
+			return fmt.Errorf("failed to write chunk to file: %w", err)
+		}
+
+		offset += int64(len(bytes))
+		if updateProgress != nil {
+			prog := offset
+			if prog > fileSize {
+				prog = fileSize
+			}
+			updateProgress(prog, "downloading_to_buffer")
+		}
+	}
+
+	return nil
+}
+
+func ProcessTelegramLinkUpload(ctx context.Context, tgLink, path, taskID string, cfg *config.Config, overwrite bool, owner string) {
+	// 1. Initial updates
+	UpdateTaskWithFile(taskID, "waiting_slot", 0, "waiting_slot", "Telegram file", owner, 0, 0)
+
+	ctx, cancel := context.WithCancel(ctx)
+	taskMutex.Lock()
+	TaskCancels[taskID] = cancel
+	taskMutex.Unlock()
+
+	defer func() {
+		taskMutex.Lock()
+		delete(TaskCancels, taskID)
+		taskMutex.Unlock()
+		cancel()
+	}()
+
+	// 2. Parse Telegram Link
+	username, channelID, msgID, err := ParseTelegramLink(tgLink)
+	if err != nil {
+		UpdateTaskWithFile(taskID, "error", 0, "err_invalid_telegram_link: "+err.Error(), "Telegram file", owner, 0, 0)
+		return
+	}
+
+	// 3. Wait for download slot (reusing globalDownloadSemaphore)
+	select {
+	case globalDownloadSemaphore <- struct{}{}:
+		defer func() { <-globalDownloadSemaphore }()
+	case <-ctx.Done():
+		UpdateTaskWithFile(taskID, "error", 0, "upload_cancelled_waiting", "Telegram file", owner, 0, 0)
+		return
+	}
+
+	UpdateTaskWithFile(taskID, "downloading", 0, "initiating_request", "Telegram file", owner, 0, 0)
+
+	// 4. Resolve Peer and fetch Message using Userbot API (Client)
+	if Client == nil {
+		UpdateTaskWithFile(taskID, "error", 0, "err_userbot_not_initialized", "Telegram file", owner, 0, 0)
+		return
+	}
+	api := Client.API()
+
+	peer, err := ResolveTelegramPeer(ctx, api, username, channelID)
+	if err != nil {
+		UpdateTaskWithFile(taskID, "error", 0, "err_resolve_peer_failed: "+err.Error(), "Telegram file", owner, 0, 0)
+		return
+	}
+
+	msg, err := FetchTelegramMessage(ctx, api, peer, msgID)
+	if err != nil {
+		UpdateTaskWithFile(taskID, "error", 0, "err_fetch_message_failed: "+err.Error(), "Telegram file", owner, 0, 0)
+		return
+	}
+
+	mediaInfo, err := ExtractTelegramMediaInfo(msg)
+	if err != nil {
+		UpdateTaskWithFile(taskID, "error", 0, "err_extract_media_failed: "+err.Error(), "Telegram file", owner, 0, 0)
+		return
+	}
+
+	filename := mediaInfo.Filename
+	size := mediaInfo.Size
+	mimeType := mediaInfo.MimeType
+	loc := mediaInfo.Location
+
+	UpdateTaskWithFile(taskID, "downloading", 0, "downloading_to_buffer", filename, owner, size, 0)
+
+	// 5. Create temp file
+	tempDir := cfg.TempDir
+	_ = os.MkdirAll(tempDir, os.ModePerm)
+	tempFilePath := filepath.Join(tempDir, "tglink_"+taskID+"_"+filename)
+
+	out, err := os.OpenFile(tempFilePath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
+	if err != nil {
+		UpdateTaskWithFile(taskID, "error", 0, "err_disk_buffer_open: "+err.Error(), filename, owner, size, 0)
+		return
+	}
+
+	// 6. Download to temp file
+	downloadErr := downloadTelegramFileToFile(ctx, api, loc, size, out, func(downloaded int64, statusMsg string) {
+		percent := int((float64(downloaded) / float64(size)) * 100)
+		if percent > 100 {
+			percent = 100
+		}
+		UpdateTaskWithFile(taskID, "downloading", percent, statusMsg, filename, owner, size, downloaded)
+	})
+	_ = out.Close()
+
+	if downloadErr != nil {
+		_ = os.Remove(tempFilePath)
+		if ctx.Err() != nil {
+			return // cancelled by user
+		}
+		UpdateTaskWithFile(taskID, "error", 0, "err_download_failed: "+downloadErr.Error(), filename, owner, size, 0)
+		return
+	}
+
+	// 7. Handover to ProcessCompleteUpload asynchronously
+	go func() {
+		defer os.Remove(tempFilePath)
+		ProcessCompleteUpload(context.Background(), tempFilePath, filename, path, mimeType, taskID, cfg, overwrite, owner)
+	}()
 }

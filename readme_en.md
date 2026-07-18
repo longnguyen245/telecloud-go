@@ -49,7 +49,7 @@
 * 📂 **WebDAV Support**: Mount TeleCloud as a network drive on Windows, macOS, and Linux.
 * 🪣 **S3 API Compatibility**: Provides an S3-compatible API (via gofakes3) to integrate with third-party clients (Rclone, Cyberduck, Infuse, etc.) supporting secure SigV4/SigV2 signature verification and Range requests for smooth video streaming.
 * 🔌 **Upload API**: Remote file uploads via HTTP API for script or CI/CD integration.
-* 📥 **URL & Media Downloader**: Download files from URLs and Media (YouTube, TikTok, Facebook...) using **yt-dlp** directly in the UI.
+* 📥 **URL, Media & Telegram (`t.me`) Downloader**: Download files from URLs and Media (YouTube, TikTok, Facebook...) using **yt-dlp**; especially supports resolving and **downloading restricted files directly** from Telegram links (`t.me` or `tg://`) via the integrated Userbot.
 * ⚡ **Background Tasks**: Background URL downloads with real-time progress notifications.
 * 🧲 **Torrent Support**: Download Torrents and Magnet links directly to Telegram via **aria2c**.
 * 👥 **Multi-user**: Support for child accounts with isolated storage spaces (Virtual Path).

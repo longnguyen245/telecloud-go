@@ -486,6 +486,40 @@ func (h *Handler) handlePostRemoteUpload(c *gin.Context) {
 		return
 	}
 
+	dbPath := mapPath(uPath, username, isAdmin)
+	if isAdmin && isChildAccountPath(dbPath) {
+		c.JSON(http.StatusForbidden, gin.H{"error": "forbidden"})
+		return
+	}
+
+	if dbPath != "/" {
+		var folder database.File
+		err := database.RODB.Get(&folder, "SELECT is_folder FROM files WHERE path = ? AND filename = ? AND is_folder = TRUE AND owner = ?", filepath.Dir(dbPath), filepath.Base(dbPath), username)
+		if err != nil {
+			c.JSON(http.StatusNotFound, gin.H{"error": "folder_not_found"})
+			return
+		}
+	}
+
+	taskID := c.PostForm("task_id")
+	if taskID == "" {
+		taskID = uuid.New().String()
+	}
+
+	// Intercept Telegram links
+	if isTelegramLink(remoteURL) {
+		if tgclient.Client == nil || !tgclient.IsAuthorized() {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "err_userbot_not_authorized"})
+			return
+		}
+		go tgclient.ProcessTelegramLinkUpload(context.Background(), remoteURL, dbPath, taskID, h.cfg, overwrite, username)
+		c.JSON(http.StatusOK, gin.H{
+			"status":  "processing",
+			"task_id": taskID,
+		})
+		return
+	}
+
 	u, err := url.ParseRequestURI(remoteURL)
 	if err != nil || (u.Scheme != "http" && u.Scheme != "https") {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid_url"})
@@ -497,25 +531,6 @@ func (h *Handler) handlePostRemoteUpload(c *gin.Context) {
 		return
 	}
 
-	dbPath := mapPath(uPath, username, isAdmin)
-	if isAdmin && isChildAccountPath(dbPath) {
-		c.JSON(http.StatusForbidden, gin.H{"error": "forbidden"})
-		return
-	}
-
-	if dbPath != "/" {
-		var folder database.File
-		err = database.RODB.Get(&folder, "SELECT is_folder FROM files WHERE path = ? AND filename = ? AND is_folder = TRUE AND owner = ?", filepath.Dir(dbPath), filepath.Base(dbPath), username)
-		if err != nil {
-			c.JSON(http.StatusNotFound, gin.H{"error": "folder_not_found"})
-			return
-		}
-	}
-
-	taskID := c.PostForm("task_id")
-	if taskID == "" {
-		taskID = uuid.New().String()
-	}
 	go tgclient.ProcessRemoteUpload(context.Background(), remoteURL, dbPath, taskID, h.cfg, overwrite, username)
 
 	c.JSON(http.StatusOK, gin.H{
@@ -528,6 +543,47 @@ func (h *Handler) handlePostRemoteUploadCheck(c *gin.Context) {
 	remoteURL := c.PostForm("url")
 	if remoteURL == "" {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "url_required"})
+		return
+	}
+
+	// Intercept Telegram links
+	if isTelegramLink(remoteURL) {
+		if tgclient.Client == nil || !tgclient.IsAuthorized() {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "err_userbot_not_authorized"})
+			return
+		}
+
+		username, channelID, msgID, err := tgclient.ParseTelegramLink(remoteURL)
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "err_invalid_telegram_link"})
+			return
+		}
+
+		api := tgclient.Client.API()
+		peer, err := tgclient.ResolveTelegramPeer(c.Request.Context(), api, username, channelID)
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "err_resolve_peer_failed: " + err.Error()})
+			return
+		}
+
+		msg, err := tgclient.FetchTelegramMessage(c.Request.Context(), api, peer, msgID)
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "err_fetch_message_failed: " + err.Error()})
+			return
+		}
+
+		mediaInfo, err := tgclient.ExtractTelegramMediaInfo(msg)
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "err_no_media_found: " + err.Error()})
+			return
+		}
+
+		c.JSON(http.StatusOK, gin.H{
+			"content_type":   mediaInfo.MimeType,
+			"content_length": mediaInfo.Size,
+			"filename":       mediaInfo.Filename,
+			"range_support":  true, // Fake range support to skip confirmation on frontend
+		})
 		return
 	}
 
@@ -1898,6 +1954,23 @@ func (h *Handler) handleRegenerateThumb(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, gin.H{"status": "ok", "has_thumb": hasThumb})
+}
+
+func isTelegramLink(link string) bool {
+	link = strings.ToLower(link)
+	if strings.HasPrefix(link, "tg://") {
+		return true
+	}
+	if strings.Contains(link, "://") {
+		parts := strings.SplitN(link, "://", 2)
+		link = parts[1]
+	}
+	parts := strings.Split(link, "/")
+	if len(parts) > 0 {
+		host := parts[0]
+		return host == "t.me" || host == "telegram.me" || host == "telegram.dog"
+	}
+	return false
 }
 
 
