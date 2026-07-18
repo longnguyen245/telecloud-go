@@ -886,10 +886,13 @@ func ProcessRemoteUpload(ctx context.Context, url, path, taskID string, cfg *con
 	TaskCancels[taskID] = cancel
 	taskMutex.Unlock()
 
+	handedOff := false
 	defer func() {
-		taskMutex.Lock()
-		delete(TaskCancels, taskID)
-		taskMutex.Unlock()
+		if !handedOff {
+			taskMutex.Lock()
+			delete(TaskCancels, taskID)
+			taskMutex.Unlock()
+		}
 		cancel()
 	}()
 
@@ -1027,6 +1030,7 @@ func ProcessRemoteUpload(ctx context.Context, url, path, taskID string, cfg *con
 		}
 
 		// Handover to ProcessCompleteUpload asynchronously
+		handedOff = true
 		go func() {
 			defer os.Remove(tempFilePath)
 			ProcessCompleteUpload(context.Background(), tempFilePath, filename, path, mimeType, taskID, cfg, overwrite, owner)
@@ -2152,7 +2156,13 @@ func ExtractTelegramMediaInfo(msg *tg.Message) (*TelegramMediaInfo, error) {
 					if len(s.Sizes) > 0 {
 						bestSize = int64(s.Sizes[len(s.Sizes)-1])
 					} else {
-						bestSize = 1
+						// Estimate size from dimensions: ~3 bytes/pixel for JPEG is a
+						// reasonable upper bound. Using 0 would break progress bars;
+						// using 1 causes division artifacts.
+						bestSize = int64(s.W) * int64(s.H) * 3
+						if bestSize <= 0 {
+							bestSize = 512 * 1024 // fallback 512 KB
+						}
 					}
 				}
 			case *tg.PhotoCachedSize:
@@ -2333,10 +2343,13 @@ func ProcessTelegramLinkUpload(ctx context.Context, tgLink, path, taskID string,
 	TaskCancels[taskID] = cancel
 	taskMutex.Unlock()
 
+	handedOff := false
 	defer func() {
-		taskMutex.Lock()
-		delete(TaskCancels, taskID)
-		taskMutex.Unlock()
+		if !handedOff {
+			taskMutex.Lock()
+			delete(TaskCancels, taskID)
+			taskMutex.Unlock()
+		}
 		cancel()
 	}()
 
@@ -2388,11 +2401,20 @@ func ProcessTelegramLinkUpload(ctx context.Context, tgLink, path, taskID string,
 	mimeType := mediaInfo.MimeType
 	loc := mediaInfo.Location
 
+	// 4b. Check disk space before downloading to temp (same pattern as torrent.go)
+	tempDir := cfg.TempDir
+	_ = os.MkdirAll(tempDir, os.ModePerm)
+	if size > 1024*1024 {
+		_, free, diskErr := utils.GetDiskSpace(tempDir)
+		if diskErr == nil && uint64(size) > free {
+			UpdateTaskWithFile(taskID, "error", 0, "err_insufficient_storage", filename, owner, size, 0)
+			return
+		}
+	}
+
 	UpdateTaskWithFile(taskID, "downloading", 0, "downloading_to_buffer", filename, owner, size, 0)
 
 	// 5. Create temp file
-	tempDir := cfg.TempDir
-	_ = os.MkdirAll(tempDir, os.ModePerm)
 	tempFilePath := filepath.Join(tempDir, "tglink_"+taskID+"_"+filename)
 
 	out, err := os.OpenFile(tempFilePath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
@@ -2421,6 +2443,7 @@ func ProcessTelegramLinkUpload(ctx context.Context, tgLink, path, taskID string,
 	}
 
 	// 7. Handover to ProcessCompleteUpload asynchronously
+	handedOff = true
 	go func() {
 		defer os.Remove(tempFilePath)
 		ProcessCompleteUpload(context.Background(), tempFilePath, filename, path, mimeType, taskID, cfg, overwrite, owner)

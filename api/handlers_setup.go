@@ -221,13 +221,14 @@ func (h *Handler) handleSetupRestart(c *gin.Context) {
 }
 
 func (h *Handler) handleSystemStatus(c *gin.Context) {
-	total, free, _ := utils.GetDiskSpace(".")
+	total, free, _ := utils.GetDiskSpace(h.cfg.TempDir)
 	c.JSON(http.StatusOK, gin.H{
 		"authorized":    tgclient.IsAuthorized(),
 		"ready":         tgclient.IsSystemReady(),
 		"running":       tgclient.IsRunning(),
 		"storage_total": total,
 		"storage_free":  free,
+		"version":       h.cfg.Version,
 	})
 }
 
