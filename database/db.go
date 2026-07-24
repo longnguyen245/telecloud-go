@@ -820,14 +820,48 @@ func migratePostgres() error {
 		ON files (path, filename, owner)
 		WHERE deleted_at IS NULL
 	`)
-	if _, err := DB.Exec(`
-		ALTER TABLE files
-		ALTER COLUMN is_folder DROP DEFAULT,
-		ALTER COLUMN is_folder TYPE BOOLEAN USING (is_folder = 1),
-		ALTER COLUMN is_folder SET DEFAULT FALSE
-	`); err != nil {
+	if err := migrateColumnToBoolean("files", "is_folder"); err != nil {
 		return err
 	}
+	if err := migrateColumnToBoolean("passkeys", "backup_state"); err != nil {
+		return err
+	}
+	if err := migrateColumnToBoolean("passkeys", "backup_eligible"); err != nil {
+		return err
+	}
+	if err := migrateColumnToBoolean("child_accounts", "webdav_enabled"); err != nil {
+		return err
+	}
+	if err := migrateColumnToBoolean("child_accounts", "api_enabled"); err != nil {
+		return err
+	}
+	if err := migrateColumnToBoolean("child_accounts", "s3_enabled"); err != nil {
+		return err
+	}
+	return err
+}
+
+func migrateColumnToBoolean(table, column string) error {
+	var dataType string
+	err := DB.QueryRow(`
+		SELECT data_type FROM information_schema.columns
+		WHERE table_name = $1 AND column_name = $2
+	`, table, column).Scan(&dataType)
+	if err != nil {
+		return err
+	}
+
+	if dataType == "boolean" {
+		// slip if boolean
+		return nil
+	}
+
+	_, err = DB.Exec(fmt.Sprintf(`
+		ALTER TABLE %s
+		ALTER COLUMN %s DROP DEFAULT,
+		ALTER COLUMN %s TYPE BOOLEAN USING (%s = 1),
+		ALTER COLUMN %s SET DEFAULT FALSE
+	`, table, column, column, column, column))
 	return err
 }
 
