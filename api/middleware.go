@@ -22,6 +22,7 @@ type chunkState struct {
 	sync.Mutex
 	received      map[int]bool
 	uploadStarted bool // guards against double-trigger in concurrent chunk finalization
+	dbCreated     bool // guards against duplicate DB inserts for upload_tasks
 }
 
 var (

@@ -15,6 +15,7 @@ import (
 	"strconv"
 	"strings"
 	"telecloud/config"
+	"sync"
 	"telecloud/database"
 	"telecloud/tgclient"
 	"telecloud/utils"
@@ -25,6 +26,13 @@ import (
 	"github.com/google/uuid"
 	"github.com/jmoiron/sqlx"
 )
+
+var chunkBufPool = sync.Pool{
+	New: func() interface{} {
+		buf := make([]byte, 64*1024)
+		return &buf
+	},
+}
 
 func (h *Handler) handleGetIndex(c *gin.Context) {
 	token, _ := c.Cookie("session_token")
@@ -389,23 +397,25 @@ func (h *Handler) handlePostUpload(c *gin.Context) {
 	// Update temporary file path with taskID and safe filename
 	tempFilePath = filepath.Join(tempDir, taskID+"_"+safeFilename)
 
-	chunkData, err := io.ReadAll(file)
-	if err != nil {
-		log.Printf("UPLOAD ERROR: Failed to read chunk: %v", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed_to_read_chunk"})
-		return
-	}
-
-	overwriteFlag := c.PostForm("overwrite") == "true"
-	database.DB.Exec(database.InsertIgnoreSQL("upload_tasks", "id, filename, owner, overwrite", "?, ?, ?, ?"), taskID, safeFilename, username, overwriteFlag)
-
 	out, err := os.OpenFile(tempFilePath, os.O_CREATE|os.O_WRONLY, 0644)
 	if err != nil {
 		log.Printf("UPLOAD ERROR: Failed to open temp file %s: %v", tempFilePath, err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed_to_open_temp_file"})
 		return
 	}
-	_, err = out.WriteAt(chunkData, offset)
+	if !loaded && totalSize > 0 {
+		_ = out.Truncate(totalSize)
+	}
+	if _, err := out.Seek(offset, io.SeekStart); err != nil {
+		out.Close()
+		log.Printf("UPLOAD ERROR: Failed to seek temp file %s: %v", tempFilePath, err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed_to_seek_temp_file"})
+		return
+	}
+
+	bufPtr := chunkBufPool.Get().(*[]byte)
+	_, err = io.CopyBuffer(out, file, *bufPtr)
+	chunkBufPool.Put(bufPtr)
 	out.Close()
 	if err != nil {
 		log.Printf("UPLOAD ERROR: Failed to write chunk to %s: %v", tempFilePath, err)
@@ -413,20 +423,21 @@ func (h *Handler) handlePostUpload(c *gin.Context) {
 		return
 	}
 
-	_, err = database.DB.Exec(database.InsertIgnoreSQL("upload_chunks", "task_id, chunk_index", "?, ?"), taskID, chunkIndex)
-	if err != nil {
-		log.Printf("UPLOAD ERROR: Failed to record chunk in DB: %v", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed_to_record_chunk"})
-		return
-	}
+	overwriteFlag := c.PostForm("overwrite") == "true"
 
 	state.Lock()
+	if !state.dbCreated {
+		state.dbCreated = true
+		go func() {
+			database.DB.Exec(database.InsertIgnoreSQL("upload_tasks", "id, filename, owner, overwrite", "?, ?, ?, ?"), taskID, safeFilename, username, overwriteFlag)
+		}()
+	}
 	state.received[chunkIndex] = true
+	go func() {
+		database.DB.Exec(database.InsertIgnoreSQL("upload_chunks", "task_id, chunk_index", "?, ?"), taskID, chunkIndex)
+	}()
 
-	// ✅ OPTIMIZATION: Count chunks directly from memory map, eliminating hot-path SQLite SELECT COUNT(*) queries.
 	actualReceived := len(state.received)
-
-	// Update task with current progress to show speed in backend
 	uploadedBytes := int64(actualReceived) * int64(chunkSize)
 	if uploadedBytes > totalSize {
 		uploadedBytes = totalSize
@@ -434,13 +445,14 @@ func (h *Handler) handlePostUpload(c *gin.Context) {
 	serverPercent := int((float64(actualReceived) / float64(totalChunks)) * 100)
 	tgclient.UpdateTaskWithFile(taskID, "uploading_to_server", serverPercent, "pushing_to_server", "", username, totalSize, uploadedBytes)
 
-	// uploadStarted guards against double-trigger
 	isDone := actualReceived == totalChunks && !state.uploadStarted
 	if isDone {
 		state.uploadStarted = true
 		chunkTrackerSync.Delete(taskID)
-		database.DB.Exec("DELETE FROM upload_chunks WHERE task_id = ?", taskID)
-		database.DB.Exec("DELETE FROM upload_tasks WHERE id = ?", taskID)
+		go func() {
+			database.DB.Exec("DELETE FROM upload_chunks WHERE task_id = ?", taskID)
+			database.DB.Exec("DELETE FROM upload_tasks WHERE id = ?", taskID)
+		}()
 	}
 	state.Unlock()
 
@@ -1360,6 +1372,18 @@ func (h *Handler) handleGetProgress(c *gin.Context) {
 func (h *Handler) handleGetUploadCheck(c *gin.Context) {
 	taskID := c.Param("task_id")
 	username := c.GetString("username")
+
+	if val, ok := chunkTrackerSync.Load(taskID); ok {
+		state := val.(*chunkState)
+		state.Lock()
+		chunks := make([]int, 0, len(state.received))
+		for chIdx := range state.received {
+			chunks = append(chunks, chIdx)
+		}
+		state.Unlock()
+		c.JSON(http.StatusOK, gin.H{"chunks": chunks})
+		return
+	}
 
 	var task struct {
 		ID string `db:"id"`
