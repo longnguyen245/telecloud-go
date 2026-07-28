@@ -17,6 +17,7 @@ type Config struct {
 	APIID            int
 	APIHash          string
 	UploadThreads    int
+	DownloadPrefetch int
 	DatabaseDriver   string
 	DatabasePath     string
 	DatabaseDSN      string
@@ -58,6 +59,15 @@ func Load() (*Config, error) {
 	uploadThreads, _ := strconv.Atoi(getEnv("TG_UPLOAD_THREADS", "2"))
 	if uploadThreads <= 0 {
 		uploadThreads = 2
+	}
+
+	// Number of 1MB chunks fetched ahead of the read cursor while streaming.
+	downloadPrefetch, _ := strconv.Atoi(getEnv("TG_DOWNLOAD_PREFETCH", "4"))
+	if downloadPrefetch <= 0 {
+		downloadPrefetch = 4
+	}
+	if downloadPrefetch > 16 {
+		downloadPrefetch = 16
 	}
 
 	logGroupID := os.Getenv("LOG_GROUP_ID")
@@ -104,6 +114,7 @@ func Load() (*Config, error) {
 		APIID:            apiID,
 		APIHash:          apiHash,
 		UploadThreads:    uploadThreads,
+		DownloadPrefetch: downloadPrefetch,
 		DatabaseDriver:   strings.ToLower(getEnv("DATABASE_DRIVER", "sqlite")),
 		DatabasePath:     getEnv("DATABASE_PATH", "database.db"),
 		DatabaseDSN:      getEnv("DATABASE_DSN", ""),

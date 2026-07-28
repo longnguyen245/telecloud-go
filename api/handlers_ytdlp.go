@@ -8,6 +8,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"telecloud/tgclient"
 	"telecloud/utils"
@@ -15,6 +16,11 @@ import (
 
 	"github.com/gin-gonic/gin"
 )
+
+// ytdlpFormatIDRe matches valid yt-dlp format selectors (e.g. "137", "137+140",
+// "bestvideo[height<=720]", "bv*+ba/b") while excluding leading dashes so the
+// value can never be parsed as a yt-dlp option flag.
+var ytdlpFormatIDRe = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9_\-+/\[\]<>=.*,]*$`)
 
 func (h *Handler) handleGetYTDLPStatus(c *gin.Context) {
 	ytdlpEnabled := h.cfg.YTDLPPath != "disabled" && h.cfg.YTDLPPath != "disable"
@@ -200,6 +206,17 @@ func (h *Handler) handlePostYTDLPDownload(c *gin.Context) {
 	taskID := c.PostForm("task_id")
 	if taskID == "" {
 		taskID = fmt.Sprintf("ytdlp_%d", time.Now().UnixNano())
+	}
+	// taskID is embedded in temp file names — reject traversal characters
+	if strings.Contains(taskID, "..") || strings.ContainsAny(taskID, "/\\") {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid_task_id"})
+		return
+	}
+	// formatID is passed to yt-dlp `-f`; restrict to the safe charset yt-dlp
+	// format selectors use, so it can never be interpreted as an option flag.
+	if formatID != "" && !ytdlpFormatIDRe.MatchString(formatID) {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid_format_id"})
+		return
 	}
 	go tgclient.ProcessYTDLPUpload(context.Background(), url, formatID, dbPath, taskID, downloadType, h.cfg, username)
 

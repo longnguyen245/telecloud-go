@@ -1274,7 +1274,30 @@ update_app() {
 
     echo "Downloading update..."
     download_file "$URL" telecloud.tar.gz || { echo "❌ Error downloading file!"; return; }
-    
+
+    # Verify checksums.txt like the initial install — prevents spoofed update binaries
+    CHECKSUMS_URL=$(echo "$API_DATA" | jq -r '.assets[] | select(.name == "checksums.txt") | .browser_download_url' | head -n 1)
+    if [ -n "$CHECKSUMS_URL" ] && [ "$CHECKSUMS_URL" != "null" ]; then
+        if download_file "$CHECKSUMS_URL" telecloud-checksums.txt; then
+            EXPECTED_SHA=$(grep "$(basename "$URL")" telecloud-checksums.txt | awk '{print $1}' | head -n 1)
+            ACTUAL_SHA=""
+            if command -v sha256sum &>/dev/null; then
+                ACTUAL_SHA=$(sha256sum telecloud.tar.gz | awk '{print $1}')
+            elif command -v shasum &>/dev/null; then
+                ACTUAL_SHA=$(shasum -a 256 telecloud.tar.gz | awk '{print $1}')
+            fi
+            rm -f telecloud-checksums.txt
+            if [ -n "$EXPECTED_SHA" ] && [ -n "$ACTUAL_SHA" ] && [ "$ACTUAL_SHA" != "$EXPECTED_SHA" ]; then
+                echo "❌ CHECKSUM MISMATCH — REFUSING update to avoid spoofed binary."
+                rm -f telecloud.tar.gz
+                return
+            fi
+            echo "✅ SHA256 verified for the update."
+        else
+            echo "⚠️  Could not download checksums.txt — skipping verification."
+        fi
+    fi
+
     stop_app
     # Backup old file to avoid overwrite issues with running process
     [ -f "$BASE_DIR/telecloud" ] && mv "$BASE_DIR/telecloud" "$BASE_DIR/telecloud.old"

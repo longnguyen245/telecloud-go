@@ -48,12 +48,12 @@ echo [+] Dang kiem tra FFmpeg...
 where ffmpeg >nul 2>nul
 if !errorlevel! equ 0 (
     echo [v] FFmpeg da duoc cai dat tren he thong.
-    goto DOWNLOAD_APP
+    goto CHECK_YTDLP
 )
 
 if exist "ffmpeg.exe" (
     echo [v] Tim thay ffmpeg.exe trong thu muc hien tai.
-    goto DOWNLOAD_APP
+    goto CHECK_YTDLP
 )
 
 echo [!] Khong tim thay FFmpeg. Dang thu cai dat...
@@ -61,7 +61,7 @@ where winget >nul 2>nul
 if !errorlevel! equ 0 (
     echo [+] Dang cai dat qua winget...
     winget install ffmpeg --source winget
-    if !errorlevel! equ 0 goto DOWNLOAD_APP
+    if !errorlevel! equ 0 goto CHECK_YTDLP
 )
 
 echo [!] Khong co winget hoac cai dat that bai. Dang tai ban portable qua PowerShell...
@@ -85,19 +85,20 @@ if exist "ffmpeg.exe" (
     pause
 )
 
+:CHECK_YTDLP
 echo [+] Dang kiem tra yt-dlp...
 where yt-dlp >nul 2>nul
 if !errorlevel! equ 0 (
     echo [v] yt-dlp da duoc cai dat tren he thong.
-    goto DOWNLOAD_APP
+    goto CHECK_ARIA2
 )
 if exist "yt-dlp.exe" (
     echo [v] Tim thay yt-dlp.exe trong thu muc hien tai.
-    goto DOWNLOAD_APP
+    goto CHECK_ARIA2
 )
 
 set /p install_ytdlp="[?] Ban co muon cai dat yt-dlp (Tai video/audio tu URL) khong? (y/n): "
-if /i not "!install_ytdlp!"=="y" goto DOWNLOAD_APP
+if /i not "!install_ytdlp!"=="y" goto CHECK_ARIA2
 
 echo [+] Dang tai yt-dlp.exe...
 powershell -Command "$progressPreference = 'SilentlyContinue'; Invoke-WebRequest -Uri 'https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp.exe' -OutFile 'yt-dlp.exe'"
@@ -105,6 +106,9 @@ if exist "yt-dlp.exe" (
     echo [v] Da tai xong yt-dlp.exe.
 ) else (
     echo [!] Tai yt-dlp.exe that bai.
+)
+
+:CHECK_ARIA2
 echo [+] Dang kiem tra aria2c...
 where aria2c >nul 2>nul
 if !errorlevel! equ 0 (
@@ -193,8 +197,9 @@ if not exist ".env" (
     echo [!] Vui long khoi dong TeleCloud (Muc 3) roi truy cap link de thiet lap:
     echo     http://127.0.0.1:8091/setup
     echo ==================================================================
-    pause
-    goto MENU
+)
+pause
+goto MENU
 
 :CLOUDFLARED_SETUP
 cls

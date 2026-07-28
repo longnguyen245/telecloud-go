@@ -77,6 +77,14 @@ var (
 	locationCache    = make(map[int]*cachedLocation)
 	cacheMutex       sync.RWMutex
 	globalChunkCache = NewBlockCache(128) // 128 MB maximum buffer size
+
+	// globalPrefetchSem caps read-ahead requests across *all* concurrent streams.
+	// Without it every viewer independently keeps prefetchDepth chunks in flight,
+	// so a few dozen viewers would swamp the handful of Telegram sessions and
+	// trigger FLOOD_WAIT. Prefetch is best-effort: once the budget is exhausted
+	// the reader silently falls back to fetching on demand, which is exactly the
+	// behaviour before read-ahead existed.
+	globalPrefetchSem = make(chan struct{}, 32)
 )
 
 func init() {
@@ -117,11 +125,21 @@ type tgFileReader struct {
 	chunkOffset int64
 
 	// Prefetch buffer
-	prefetchChunks map[int64][]byte // offset → prefetched chunk data
-	prefetchMu     sync.Mutex
-	prefetchSem    chan struct{} // capacity 1: ensures only one prefetch goroutine at a time
-	locMu          sync.Mutex    // Protects loc and api updates during file reference refreshes
+	prefetchChunks   map[int64][]byte        // offset → prefetched chunk data
+	prefetchInflight map[int64]chan struct{} // offset → channel closed when that fetch finishes
+	prefetchGen      uint64                  // bumped on Seek to discard in-flight results
+	prefetchDepth    int                     // how many chunks to keep in flight ahead of the cursor
+	prefetchMu       sync.Mutex
+	prefetchSem      chan struct{} // caps concurrent prefetch goroutines for this reader
+	locMu            sync.Mutex    // Protects loc and api updates during file reference refreshes
+
+	// fetch performs the actual chunk download. Indirected so tests can run the
+	// caching/prefetch logic without touching the network.
+	fetch func(api *tg.Client, offset int64, limit int64) ([]byte, error)
 }
+
+// pickDownloadAPI selects the session used for background prefetches.
+var pickDownloadAPI = GetAPI
 
 func (r *tgFileReader) Close() error {
 	if r.cancel != nil {
@@ -141,48 +159,19 @@ func (r *tgFileReader) Read(p []byte) (int, error) {
 	if r.chunkData == nil || r.offset < r.chunkOffset || r.offset >= r.chunkOffset+int64(len(r.chunkData)) {
 		chunkStart := (r.offset / chunkSize) * chunkSize
 
-		// Try to get the chunk from the prefetch buffer
-		r.prefetchMu.Lock()
-		if data, ok := r.prefetchChunks[chunkStart]; ok {
-			if r.offset >= chunkStart+int64(len(data)) {
-				delete(r.prefetchChunks, chunkStart)
-				r.prefetchMu.Unlock()
-				return 0, io.ErrUnexpectedEOF
-			}
-			r.chunkData = data
-			r.chunkOffset = chunkStart
-			delete(r.prefetchChunks, chunkStart)
-			r.prefetchMu.Unlock()
+		// Kick off the read-ahead window BEFORE blocking on the current chunk, so the
+		// following chunks are already downloading in parallel while we wait for this one.
+		r.fillPrefetchWindow(chunkStart, chunkSize)
 
-			// Cache in global cache for other readers to reuse
-			globalChunkCache.Add(fmt.Sprintf("%d_%d", r.msgID, chunkStart), data)
-		} else {
-			r.prefetchMu.Unlock()
-
-			// Try to get the chunk from the global chunk cache
-			cacheKey := fmt.Sprintf("%d_%d", r.msgID, chunkStart)
-			if data, ok := globalChunkCache.Get(cacheKey); ok {
-				if r.offset >= chunkStart+int64(len(data)) {
-					return 0, io.ErrUnexpectedEOF
-				}
-				r.chunkData = data
-				r.chunkOffset = chunkStart
-			} else {
-				// Fallback: synchronous fetch with retries
-				data, err := r.fetchChunk(r.api, chunkStart, chunkSize)
-				if err != nil {
-					return 0, err
-				}
-				if r.offset >= chunkStart+int64(len(data)) {
-					return 0, io.ErrUnexpectedEOF
-				}
-				r.chunkData = data
-				r.chunkOffset = chunkStart
-
-				// Store in global cache
-				globalChunkCache.Add(cacheKey, data)
-			}
+		data, err := r.getChunk(chunkStart, chunkSize)
+		if err != nil {
+			return 0, err
 		}
+		if r.offset >= chunkStart+int64(len(data)) {
+			return 0, io.ErrUnexpectedEOF
+		}
+		r.chunkData = data
+		r.chunkOffset = chunkStart
 	}
 
 	// Copy data to caller's buffer
@@ -190,20 +179,74 @@ func (r *tgFileReader) Read(p []byte) (int, error) {
 	n := copy(p, r.chunkData[inChunkOffset:])
 	r.offset += int64(n)
 
-	// Trigger prefetch for the NEXT chunk when we reach the midpoint of current chunk.
-	// Uses a different bot than the sync fallback to spread rate-limit across sessions.
-	if inChunkOffset >= int64(len(r.chunkData))/2 {
-		r.triggerPrefetch(r.chunkOffset+chunkSize, chunkSize)
-	}
+	// Top the window back up as prefetch goroutines complete.
+	r.fillPrefetchWindow(r.chunkOffset, chunkSize)
 
 	return n, nil
 }
 
-// triggerPrefetch launches a single background goroutine to fetch the next chunk
-// using a different bot than the synchronous fallback path. This spreads the
-// Telegram rate-limit across sessions without overwhelming a single DC.
+// getChunk returns the chunk starting at chunkStart, preferring (in order) the
+// prefetch buffer, an already in-flight prefetch, the global cache, and finally a
+// synchronous fetch. Waiting on an in-flight prefetch avoids issuing a duplicate
+// upload.getFile for a chunk that is already being downloaded.
+func (r *tgFileReader) getChunk(chunkStart int64, chunkSize int64) ([]byte, error) {
+	cacheKey := fmt.Sprintf("%d_%d", r.msgID, chunkStart)
+
+	r.prefetchMu.Lock()
+	if data, ok := r.prefetchChunks[chunkStart]; ok {
+		delete(r.prefetchChunks, chunkStart)
+		r.prefetchMu.Unlock()
+		return data, nil
+	}
+	done, inflight := r.prefetchInflight[chunkStart]
+	r.prefetchMu.Unlock()
+
+	if inflight {
+		select {
+		case <-done:
+		case <-r.ctx.Done():
+			return nil, r.ctx.Err()
+		}
+		r.prefetchMu.Lock()
+		if data, ok := r.prefetchChunks[chunkStart]; ok {
+			delete(r.prefetchChunks, chunkStart)
+			r.prefetchMu.Unlock()
+			return data, nil
+		}
+		r.prefetchMu.Unlock()
+		// Prefetch failed or was discarded by a seek; fall through.
+	}
+
+	if data, ok := globalChunkCache.Get(cacheKey); ok {
+		return data, nil
+	}
+
+	data, err := r.fetch(r.api, chunkStart, chunkSize)
+	if err != nil {
+		return nil, err
+	}
+	globalChunkCache.Add(cacheKey, data)
+	return data, nil
+}
+
+// fillPrefetchWindow keeps up to prefetchDepth chunks after fromChunk in flight.
+func (r *tgFileReader) fillPrefetchWindow(fromChunk int64, chunkSize int64) {
+	for i := int64(1); i <= int64(r.prefetchDepth); i++ {
+		r.triggerPrefetch(fromChunk+i*chunkSize, chunkSize)
+	}
+}
+
+// triggerPrefetch launches a background goroutine to fetch one chunk using a
+// different bot than the synchronous path. This spreads the Telegram rate-limit
+// across sessions without overwhelming a single DC.
 func (r *tgFileReader) triggerPrefetch(offset int64, limit int64) {
 	if offset >= r.size {
+		return
+	}
+
+	// Check if already in global chunk cache
+	cacheKey := fmt.Sprintf("%d_%d", r.msgID, offset)
+	if _, ok := globalChunkCache.Get(cacheKey); ok {
 		return
 	}
 
@@ -213,32 +256,44 @@ func (r *tgFileReader) triggerPrefetch(offset int64, limit int64) {
 		r.prefetchMu.Unlock()
 		return
 	}
-	r.prefetchMu.Unlock()
-
-	// Check if already in global chunk cache
-	cacheKey := fmt.Sprintf("%d_%d", r.msgID, offset)
-	if _, ok := globalChunkCache.Get(cacheKey); ok {
+	if _, running := r.prefetchInflight[offset]; running {
+		r.prefetchMu.Unlock()
 		return
 	}
-
-	// Non-blocking: if a prefetch is already running, skip
+	// Non-blocking: respect the per-reader concurrency cap.
 	select {
 	case r.prefetchSem <- struct{}{}:
 	default:
+		r.prefetchMu.Unlock()
 		return
 	}
+	// Non-blocking: respect the server-wide read-ahead budget shared by all streams.
+	select {
+	case globalPrefetchSem <- struct{}{}:
+	default:
+		<-r.prefetchSem
+		r.prefetchMu.Unlock()
+		return
+	}
+	done := make(chan struct{})
+	r.prefetchInflight[offset] = done
+	gen := r.prefetchGen
+	r.prefetchMu.Unlock()
 
 	go func() {
-		defer func() { <-r.prefetchSem }()
+		defer func() {
+			r.prefetchMu.Lock()
+			if r.prefetchInflight[offset] == done {
+				delete(r.prefetchInflight, offset)
+			}
+			r.prefetchMu.Unlock()
+			close(done)
+			<-globalPrefetchSem
+			<-r.prefetchSem
+		}()
 
-		// Double check global cache before network call
-		if _, ok := globalChunkCache.Get(cacheKey); ok {
-			return
-		}
-
-		// Use a different bot than the one used for sync fallback
-		fetchAPI := GetAPI()
-		data, err := r.fetchChunk(fetchAPI, offset, limit)
+		// Use a different bot than the one used for the synchronous path
+		data, err := r.fetch(pickDownloadAPI(), offset, limit)
 		if err != nil {
 			return
 		}
@@ -247,7 +302,11 @@ func (r *tgFileReader) triggerPrefetch(offset int64, limit int64) {
 		globalChunkCache.Add(cacheKey, data)
 
 		r.prefetchMu.Lock()
-		r.prefetchChunks[offset] = data
+		// Discard if the caller seeked away: the chunk stays in the global cache,
+		// but the per-reader buffer must not grow with chunks nobody will read.
+		if r.prefetchGen == gen {
+			r.prefetchChunks[offset] = data
+		}
 		r.prefetchMu.Unlock()
 	}()
 }
@@ -348,12 +407,17 @@ func (r *tgFileReader) fetchChunk(api *tg.Client, offset int64, limit int64) ([]
 
 		if strings.Contains(errStr, "FLOOD_WAIT") || strings.Contains(errStr, "TIMEOUT") || strings.Contains(errStr, "RPC_CALL_FAIL") {
 			waitDuration := time.Duration(attempt+1) * 2 * time.Second
-			if strings.Contains(errStr, "FLOOD_WAIT_") {
-				parts := strings.Split(errStr, "FLOOD_WAIT_")
-				if len(parts) > 1 {
-					if secs, e := fmt.Sscanf(parts[1], "%d", new(int)); e == nil && secs > 0 {
-						waitDuration = time.Duration(secs) * time.Second
-					}
+			if secs, ok := ParseFloodWait(err); ok {
+				// Take this session out of the rotation so other downloads stop
+				// picking it while it is rate-limited.
+				MarkBotCooldown(api, secs)
+				waitDuration = time.Duration(secs) * time.Second
+
+				// Waiting out a long flood would stall the stream. Retry immediately on
+				// another session instead; GetAPI skips the ones in cooldown.
+				if next := GetAPI(); next != api {
+					api = next
+					waitDuration = 0
 				}
 			}
 			select {
@@ -404,9 +468,12 @@ func (r *tgFileReader) Seek(offset int64, whence int) (int64, error) {
 	}
 	if newOffset != r.offset {
 		r.offset = newOffset
-		// Invalidate prefetch buffer and current chunk on seek
+		// Invalidate prefetch buffer and current chunk on seek. Bumping the generation
+		// makes results of in-flight prefetches be dropped instead of piling up in the
+		// buffer for a position nobody will read (they are still kept in the global cache).
 		r.prefetchMu.Lock()
 		r.prefetchChunks = make(map[int64][]byte)
+		r.prefetchGen++
 		r.prefetchMu.Unlock()
 		r.chunkData = nil
 		r.chunkOffset = 0
@@ -599,17 +666,7 @@ var getSinglePartReader = func(ctx context.Context, msgID int, size int64, cfg *
 	cacheMutex.RUnlock()
 
 	if ok && time.Now().Before(cached.expiresAt) {
-		return &tgFileReader{
-			ctx:            ctx,
-			cancel:         cancel,
-			api:            cached.api,
-			loc:            cached.loc,
-			size:           size,
-			msgID:          msgID,
-			cfg:            cfg,
-			prefetchChunks: make(map[int64][]byte),
-			prefetchSem:    make(chan struct{}, 1),
-		}, nil
+		return newTGFileReader(ctx, cancel, cached.api, cached.loc, size, msgID, cfg), nil
 	}
 
 	// Helper function to resolve media from a specific API client
@@ -648,19 +705,29 @@ var getSinglePartReader = func(ctx context.Context, msgID int, size int64, cfg *
 	}
 	cacheMutex.Unlock()
 
-	reader := &tgFileReader{
-		ctx:            ctx,
-		cancel:         cancel,
-		api:            api,
-		loc:            loc,
-		size:           size,
-		msgID:          msgID,
-		cfg:            cfg,
-		prefetchChunks: make(map[int64][]byte),
-		prefetchSem:    make(chan struct{}, 1),
-	}
+	return newTGFileReader(ctx, cancel, api, loc, size, msgID, cfg), nil
+}
 
-	return reader, nil
+func newTGFileReader(ctx context.Context, cancel context.CancelFunc, api *tg.Client, loc tg.InputFileLocationClass, size int64, msgID int, cfg *config.Config) *tgFileReader {
+	depth := 4
+	if cfg != nil && cfg.DownloadPrefetch > 0 {
+		depth = cfg.DownloadPrefetch
+	}
+	r := &tgFileReader{
+		ctx:              ctx,
+		cancel:           cancel,
+		api:              api,
+		loc:              loc,
+		size:             size,
+		msgID:            msgID,
+		cfg:              cfg,
+		prefetchChunks:   make(map[int64][]byte),
+		prefetchInflight: make(map[int64]chan struct{}),
+		prefetchDepth:    depth,
+		prefetchSem:      make(chan struct{}, depth),
+	}
+	r.fetch = r.fetchChunk
+	return r
 }
 
 type multiPartReader struct {
@@ -671,8 +738,8 @@ type multiPartReader struct {
 	offset int64
 	cfg    *config.Config
 
-	currentReader       io.ReadSeekCloser
-	currentIndex        int
+	currentReader        io.ReadSeekCloser
+	currentIndex         int
 	currentPartRemaining int64 // bytes left in current part before EOF
 
 	// Pre-initialized next part reader (avoids gap between parts)
@@ -686,7 +753,7 @@ func (r *multiPartReader) Close() error {
 	if r.currentReader != nil {
 		r.currentReader.Close()
 	}
-	
+
 	r.mu.Lock()
 	if r.nextReader != nil {
 		r.nextReader.Close()
@@ -764,7 +831,7 @@ func (r *multiPartReader) Read(p []byte) (int, error) {
 			// location and prefetching its first chunk while we still have data to serve.
 			const prefetchThreshold = int64(2 * 1024 * 1024) // 2MB
 			nextIdx := r.currentIndex + 1
-			
+
 			r.mu.Lock()
 			shouldPrefetch := !r.nextInitialized && r.currentPartRemaining <= prefetchThreshold && nextIdx < len(r.parts)
 			if shouldPrefetch {
@@ -775,7 +842,7 @@ func (r *multiPartReader) Read(p []byte) (int, error) {
 
 				go func() {
 					reader, err := getSinglePartReader(r.ctx, nextPart.MessageID, nextPart.Size, r.cfg)
-					
+
 					r.mu.Lock()
 					defer r.mu.Unlock()
 
@@ -846,7 +913,7 @@ func (r *multiPartReader) Seek(offset int64, whence int) (int64, error) {
 			r.currentReader.Close()
 			r.currentReader = nil
 		}
-		
+
 		r.mu.Lock()
 		if r.nextReader != nil {
 			r.nextReader.Close()

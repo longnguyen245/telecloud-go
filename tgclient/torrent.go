@@ -422,6 +422,10 @@ func ProcessTorrentUpload(ctx context.Context, input, path, taskID string, cfg *
 		UpdateTaskWithSpeed(subTaskID, "telegram", 0, msg, filename, owner, fSize, 0, 0)
 
 		ProcessCompleteUpload(torrentCtx, filePath, filename, subDestPath, detectMIME(filename), subTaskID, cfg, false, owner)
+
+		// Free disk space immediately instead of holding every file until the
+		// whole batch finishes (large multi-file torrents could exhaust TempDir).
+		os.Remove(filePath)
 	}
 }
 

@@ -1385,7 +1385,30 @@ update_app() {
 
     echo "Đang tải bản cập nhật..."
     download_file "$URL" telecloud.tar.gz || { echo "❌ Lỗi khi tải file!"; return; }
-    
+
+    # Xác thực checksums.txt như lúc cài đặt lần đầu — tránh binary giả mạo khi update
+    CHECKSUMS_URL=$(echo "$API_DATA" | jq -r '.assets[] | select(.name == "checksums.txt") | .browser_download_url' | head -n 1)
+    if [ -n "$CHECKSUMS_URL" ] && [ "$CHECKSUMS_URL" != "null" ]; then
+        if download_file "$CHECKSUMS_URL" telecloud-checksums.txt; then
+            EXPECTED_SHA=$(grep "$(basename "$URL")" telecloud-checksums.txt | awk '{print $1}' | head -n 1)
+            ACTUAL_SHA=""
+            if command -v sha256sum &>/dev/null; then
+                ACTUAL_SHA=$(sha256sum telecloud.tar.gz | awk '{print $1}')
+            elif command -v shasum &>/dev/null; then
+                ACTUAL_SHA=$(shasum -a 256 telecloud.tar.gz | awk '{print $1}')
+            fi
+            rm -f telecloud-checksums.txt
+            if [ -n "$EXPECTED_SHA" ] && [ -n "$ACTUAL_SHA" ] && [ "$ACTUAL_SHA" != "$EXPECTED_SHA" ]; then
+                echo "❌ CHECKSUM SAI — TỪ CHỐI cập nhật để tránh binary giả mạo."
+                rm -f telecloud.tar.gz
+                return
+            fi
+            echo "✅ Đã xác thực SHA256 cho bản cập nhật."
+        else
+            echo "⚠️  Không tải được checksums.txt — bỏ qua xác thực."
+        fi
+    fi
+
     stop_app
     # Backup file cũ để tránh lỗi ghi đè file đang dùng
     [ -f "$BASE_DIR/telecloud" ] && mv "$BASE_DIR/telecloud" "$BASE_DIR/telecloud.old"

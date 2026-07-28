@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"telecloud/tgclient"
@@ -83,6 +84,11 @@ func (h *Handler) handlePostTorrentAdd(c *gin.Context) {
 	taskID := c.PostForm("task_id")
 	if taskID == "" {
 		taskID = fmt.Sprintf("torrent_%d", time.Now().UnixNano())
+	}
+	// taskID is used in temp dir paths — reject traversal characters
+	if strings.Contains(taskID, "..") || strings.ContainsAny(taskID, "/\\") {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid_task_id"})
+		return
 	}
 
 	go tgclient.ProcessTorrentUpload(context.Background(), input, dbPath, taskID, h.cfg, username)

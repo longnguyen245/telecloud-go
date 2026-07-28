@@ -137,7 +137,7 @@ func (h *Handler) handleGetIndex(c *gin.Context) {
 		"bot_tokens":            database.GetSetting("bot_tokens"),
 		"bot_statuses":          botStatusesStr,
 		"bot_admin_ids":         database.GetSetting("bot_admin_ids"),
-		"telegram_user_id":       database.GetUserSetting(sessionUsername, "telegram_user_id"),
+		"telegram_user_id":      database.GetUserSetting(sessionUsername, "telegram_user_id"),
 		"bot_pool_upload_folder": func() string {
 			f := database.GetUserSetting(sessionUsername, "bot_pool_upload_folder")
 			if f == "" {
@@ -1890,30 +1890,61 @@ func (h *Handler) handleDownloadFolder(c *gin.Context) {
 			}
 			_, _ = zw.Create(zipPath)
 		} else {
+			// Skip Deflate for already-compressed formats (video, images, audio,
+			// archives): re-compressing wastes CPU and throttles stream throughput.
+			method := zip.Deflate
+			if isPrecompressed(item.Filename) {
+				method = zip.Store
+			}
 			header := &zip.FileHeader{
 				Name:   zipPath,
-				Method: zip.Deflate,
+				Method: method,
 			}
 			header.Modified = item.CreatedAt
 
 			writer, err := zw.CreateHeader(header)
 			if err != nil {
+				log.Printf("[FolderZip] Failed to create zip header for %q: %v", zipPath, err)
 				continue
 			}
 
 			reader, err := tgclient.GetTelegramFileReader(c.Request.Context(), item, h.cfg)
 			if err != nil {
+				log.Printf("[FolderZip] Failed to open reader for %q (id=%d): %v", zipPath, item.ID, err)
 				continue
 			}
 
-			_, _ = io.Copy(writer, reader)
+			_, copyErr := io.Copy(writer, reader)
 			reader.Close()
+			if copyErr != nil {
+				// Mid-file failure corrupts the archive; abort instead of silently
+				// producing a broken/truncated ZIP.
+				log.Printf("[FolderZip] Stream error for %q (id=%d), aborting download: %v", zipPath, item.ID, copyErr)
+				return
+			}
 
 			if flusher, ok := c.Writer.(http.Flusher); ok {
 				flusher.Flush()
 			}
 		}
 	}
+}
+
+// isPrecompressed reports whether a filename refers to a format that is already
+// compressed, so ZIP Deflate would only waste CPU with no size gain.
+func isPrecompressed(filename string) bool {
+	switch strings.ToLower(filepath.Ext(filename)) {
+	case // video
+		".mp4", ".mkv", ".webm", ".avi", ".mov", ".wmv", ".flv", ".m4v", ".ts", ".mpg", ".mpeg", ".3gp",
+		// audio
+		".mp3", ".m4a", ".aac", ".ogg", ".opus", ".flac", ".wma",
+		// images
+		".jpg", ".jpeg", ".png", ".gif", ".webp", ".heic", ".heif", ".avif",
+		// archives & compressed containers
+		".zip", ".rar", ".7z", ".gz", ".bz2", ".xz", ".zst", ".cbz", ".cbr", ".epub", ".apk", ".jar", ".docx", ".xlsx", ".pptx":
+		return true
+	}
+	return false
 }
 
 func (h *Handler) handleTempStreamFile(c *gin.Context) {
@@ -1996,5 +2027,3 @@ func isTelegramLink(link string) bool {
 	}
 	return false
 }
-
-

@@ -22,6 +22,7 @@ import (
 
 	"telecloud/config"
 	"telecloud/database"
+	"telecloud/utils"
 
 	"github.com/google/uuid"
 	"golang.org/x/image/draw"
@@ -33,7 +34,10 @@ type TempStreamInfo struct {
 }
 
 var TempStreamTokens sync.Map
-var ffmpegSemaphore = make(chan struct{}, 2)
+
+// ffmpegSemaphore aliases the process-wide FFmpeg cap so upload-time
+// thumbnails (utils.CreateLocalThumbnail) and regeneration share one budget.
+var ffmpegSemaphore = utils.FFmpegSemaphore
 
 // readerAtSeeker wraps an io.ReadSeeker to implement io.ReaderAt
 type readerAtSeeker struct {

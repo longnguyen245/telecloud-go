@@ -101,8 +101,13 @@ func GetYTDLPFormats(url string, cfg *config.Config, owner string) (*YTDLPInfo, 
 		args = append([]string{"--cookies", cookieFile}, args...)
 	}
 
+	// Timeout so a hung yt-dlp (slow site, dead network) cannot block the
+	// HTTP handler indefinitely.
+	infoCtx, cancelInfo := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancelInfo()
+
 	var stdout, stderr strings.Builder
-	cmd := exec.Command(cfg.YTDLPPath, args...)
+	cmd := exec.CommandContext(infoCtx, cfg.YTDLPPath, args...)
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
 
@@ -133,6 +138,9 @@ func GetYTDLPFormats(url string, cfg *config.Config, owner string) (*YTDLPInfo, 
 
 	err := cmd.Run()
 	if err != nil {
+		if infoCtx.Err() == context.DeadlineExceeded {
+			return nil, fmt.Errorf("ytdlp_timeout")
+		}
 		// Clean up common yt-dlp error prefixes from stderr
 		errMsg := stderr.String()
 		if idx := strings.Index(errMsg, "ERROR:"); idx != -1 {
@@ -254,6 +262,22 @@ func ProcessYTDLPUpload(ctx context.Context, url, formatID, path, taskID, downlo
 	// Use a unique filename for the download to avoid collisions
 	tempFileName := fmt.Sprintf("ytdlp_%s_%%(title)s.%%(ext)s", taskID)
 	tempPathPattern := filepath.Join(cfg.TempDir, tempFileName)
+
+	// Purge ALL files created for this task (.part, .ytdl, intermediate .fXXX
+	// fragments, final file) on every exit path. Without this, cancellation or
+	// mid-download errors leaked partial files into TempDir until reboot.
+	cleanupPrefix := "ytdlp_" + taskID + "_"
+	defer func() {
+		entries, err := os.ReadDir(cfg.TempDir)
+		if err != nil {
+			return
+		}
+		for _, e := range entries {
+			if !e.IsDir() && strings.HasPrefix(e.Name(), cleanupPrefix) {
+				os.Remove(filepath.Join(cfg.TempDir, e.Name()))
+			}
+		}
+	}()
 
 	args := []string{
 		"--newline",
@@ -500,8 +524,7 @@ func ProcessYTDLPUpload(ctx context.Context, url, formatID, path, taskID, downlo
 		return
 	}
 
-	// Ensure cleanup
-	defer os.Remove(downloadedFile)
+	// Cleanup handled by the deferred prefix sweep above.
 
 	// Prepare for upload
 	filename := filepath.Base(downloadedFile)

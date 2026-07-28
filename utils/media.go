@@ -2,13 +2,11 @@ package utils
 
 import (
 	"archive/zip"
-	"bytes"
 	"fmt"
 	"image"
 	_ "image/gif"
 	"image/jpeg"
 	_ "image/png"
-	"io"
 	"mime"
 	"os"
 	"os/exec"
@@ -34,6 +32,10 @@ func FormatBytes(b int64) string {
 }
 
 var ThumbsDir string
+
+// FFmpegSemaphore caps concurrent FFmpeg subprocesses process-wide (upload
+// thumbnails and regeneration alike) to prevent host CPU starvation.
+var FFmpegSemaphore = make(chan struct{}, 2)
 
 func InitMedia(dir string) {
 	ThumbsDir = dir
@@ -64,6 +66,8 @@ func CreateLocalThumbnail(sourcePath, mimeType, ffmpegPath string) *string {
 		if ffmpegPath == "disabled" {
 			return nil
 		}
+		FFmpegSemaphore <- struct{}{}
+		defer func() { <-FFmpegSemaphore }()
 		cmd := exec.Command(
 			ffmpegPath, "-y", "-ss", "00:00:01.000", "-i", sourcePath,
 			"-vframes", "1",
@@ -79,6 +83,8 @@ func CreateLocalThumbnail(sourcePath, mimeType, ffmpegPath string) *string {
 		if ffmpegPath == "disabled" {
 			return nil
 		}
+		FFmpegSemaphore <- struct{}{}
+		defer func() { <-FFmpegSemaphore }()
 		cmd := exec.Command(
 			ffmpegPath, "-y", "-i", sourcePath,
 			"-an", "-vframes", "1",
@@ -188,12 +194,9 @@ func extractZipCover(sourcePath, thumbPath string) *string {
 	}
 	defer rc.Close()
 
-	data, err := io.ReadAll(rc)
-	if err != nil {
-		return nil
-	}
-
-	img, _, err := image.Decode(bytes.NewReader(data))
+	// Decode straight from the stream; buffering the whole image in RAM first
+	// is wasteful for large covers.
+	img, _, err := image.Decode(rc)
 	if err != nil {
 		return nil
 	}
@@ -224,12 +227,15 @@ func extractZipCover(sourcePath, thumbPath string) *string {
 }
 
 func resizeImage(source, target string) error {
-	data, err := os.ReadFile(source)
+	// Decode straight from the file; os.ReadFile would load the entire image
+	// (potentially hundreds of MB for large photos) into heap RAM.
+	src, err := os.Open(source)
 	if err != nil {
 		return err
 	}
+	defer src.Close()
 
-	img, _, err := image.Decode(bytes.NewReader(data))
+	img, _, err := image.Decode(src)
 	if err != nil {
 		return err
 	}

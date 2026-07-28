@@ -48,12 +48,12 @@ echo [+] Checking for FFmpeg...
 where ffmpeg >nul 2>nul
 if !errorlevel! equ 0 (
     echo [v] FFmpeg is already installed on the system.
-    goto DOWNLOAD_APP
+    goto CHECK_YTDLP
 )
 
 if exist "ffmpeg.exe" (
     echo [v] Found ffmpeg.exe in current directory.
-    goto DOWNLOAD_APP
+    goto CHECK_YTDLP
 )
 
 echo [!] FFmpeg not found. Attempting to install...
@@ -61,7 +61,7 @@ where winget >nul 2>nul
 if !errorlevel! equ 0 (
     echo [+] Installing via winget...
     winget install ffmpeg --source winget
-    if !errorlevel! equ 0 goto DOWNLOAD_APP
+    if !errorlevel! equ 0 goto CHECK_YTDLP
 )
 
 echo [!] winget not found or installation failed. Downloading portable version via PowerShell...
@@ -85,19 +85,20 @@ if exist "ffmpeg.exe" (
     pause
 )
 
+:CHECK_YTDLP
 echo [+] Checking for yt-dlp...
 where yt-dlp >nul 2>nul
 if !errorlevel! equ 0 (
     echo [v] yt-dlp is already installed on the system.
-    goto DOWNLOAD_APP
+    goto CHECK_ARIA2
 )
 if exist "yt-dlp.exe" (
     echo [v] Found yt-dlp.exe in current directory.
-    goto DOWNLOAD_APP
+    goto CHECK_ARIA2
 )
 
 set /p install_ytdlp="[?] Do you want to install yt-dlp (Download video/audio from URL)? (y/n): "
-if /i not "!install_ytdlp!"=="y" goto DOWNLOAD_APP
+if /i not "!install_ytdlp!"=="y" goto CHECK_ARIA2
 
 echo [+] Downloading yt-dlp.exe...
 powershell -Command "$progressPreference = 'SilentlyContinue'; Invoke-WebRequest -Uri 'https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp.exe' -OutFile 'yt-dlp.exe'"
@@ -105,6 +106,9 @@ if exist "yt-dlp.exe" (
     echo [v] Downloaded yt-dlp.exe successfully.
 ) else (
     echo [!] Could not download yt-dlp.exe.
+)
+
+:CHECK_ARIA2
 echo [+] Checking for aria2c...
 where aria2c >nul 2>nul
 if !errorlevel! equ 0 (
@@ -193,8 +197,9 @@ if not exist ".env" (
     echo [!] Please start TeleCloud (Option 3) then visit the setup link:
     echo     http://127.0.0.1:8091/setup
     echo ==================================================================
-    pause
-    goto MENU
+)
+pause
+goto MENU
 
 :CLOUDFLARED_SETUP
 cls
